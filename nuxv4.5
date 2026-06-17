@@ -1,0 +1,2974 @@
+#!/usr/bin/env python3
+# ══════════════════════════════════════════════════════════════════
+# nux — Nucora Linux Package Manager v4.5.0
+# ══════════════════════════════════════════════════════════════════
+#
+# Copyright (C) 2026 Nucora Linux
+# By: Efe Enes
+# License: GNU General Public License v3.0
+# https://www.gnu.org/licenses/gpl-3.0.html
+#
+# Nux and Nucora are fully developed and maintained by one person.
+# Not difficult — just time, patience, and persistence.
+#
+# Package class system: app / base / tool
+# Managed-by system: nux / system
+# Multi-language: Turkish / English
+# Multi-repo support
+#
+# ══════════════════════════════════════════════════════════════════
+
+import os
+import re
+import sys
+import json
+import tarfile
+import hashlib
+import shutil
+import tempfile
+import subprocess
+import urllib.request
+import urllib.error
+import gzip
+import time
+import socket
+import threading
+import warnings
+from pathlib import Path
+from datetime import datetime
+from functools import cmp_to_key
+from typing import List, Dict, Set, Optional, Tuple
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+CLIENT_VERSION = "4.5.0"
+
+# ══════════════════════════════════════════════════════════════════
+# DOSYA YOLLARI
+# ══════════════════════════════════════════════════════════════════
+
+NUX_BIN = "/usr/local/bin/nux"
+NUX_LIB = "/usr/local/lib/nux"
+CONFIG_DIR = "/etc/nux"
+CONFIG_FILE = f"{CONFIG_DIR}/config.json"
+REPOS_FILE = f"{CONFIG_DIR}/repos.json"
+KURULU_DB = "/var/lib/nux/installed.json"
+CACHE_DIR = "/var/cache/nux"
+LOG_FILE = "/var/log/nux.log"
+HISTORY_FILE = "/var/lib/nux/history.json"
+PIN_FILE = "/var/lib/nux/pinned.json"
+LOCK_FILE = "/var/lock/nux.lock"
+INDEX_CACHE_DIR = f"{CACHE_DIR}/indexes"
+SCRIPTS_ROOT = "/var/lib/nux/scripts"
+SNAPSHOT_DIR = "/var/lib/nux/snapshots"
+
+# ══════════════════════════════════════════════════════════════════
+# VARSAYILANLAR
+# ══════════════════════════════════════════════════════════════════
+
+DEFAULT_REPO_URL = "https://repo.nucoralinux.com.tr/nux"
+DEFAULT_REPO_NAME = "nucora-main"
+
+QUIET = False
+ASSUME_YES = False
+VERBOSE = False
+
+PKG_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
+
+IGNORED_DEPS = {
+    "apt-transport-https", "software-properties-common",
+    "lsb-release", "gnupg", "gnupg2", "dirmngr",
+    "debian-archive-keyring", "ubuntu-keyring", "nucora-archive-keyring",
+    "brave-keyring",
+}
+
+IGNORED_DEP_SUFFIXES = ("-keyring", "-archive-keyring")
+
+PROTECTED_PACKAGES = {
+    "nux", "bash", "coreutils", "libc6", "libstdc++6",
+    "sudo", "tar", "gzip", "xz-utils", "bzip2",
+    "util-linux", "base-files", "tzdata", "passwd", "login",
+    "dpkg", "apt", "init", "sed", "grep", "findutils",
+    "mount", "hostname", "ncurses-base", "debianutils",
+    "diffutils", "dash", "perl-base", "mawk", "sensible-utils",
+}
+
+TOOL_PACKAGES = {"nux"}
+TOOL_PREFIXES = ("nucora-",)
+
+# ══════════════════════════════════════════════════════════════════
+# CONFIG YÖNETİMİ
+# ══════════════════════════════════════════════════════════════════
+
+DEFAULT_CONFIG = {
+    "language": "tr",
+    "theme": "default",
+    "spinner": "braille",
+    "install_animation": "stepped",
+    "progress_style": "detailed",
+    "show_stats": True,
+}
+
+DEFAULT_REPOS = {
+    "repos": [
+        {
+            "name": DEFAULT_REPO_NAME,
+            "url": DEFAULT_REPO_URL,
+            "enabled": True,
+            "priority": 100,
+            "description": "Nucora Linux Ana Repo",
+        }
+    ]
+}
+
+def config_yukle() -> Dict:
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+            merged = {**DEFAULT_CONFIG, **cfg}
+            return merged
+    except Exception:
+        return DEFAULT_CONFIG.copy()
+
+def config_kaydet(cfg: Dict):
+    Path(CONFIG_DIR).mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+def repos_yukle() -> List[Dict]:
+    try:
+        with open(REPOS_FILE) as f:
+            data = json.load(f)
+            return data.get("repos", [])
+    except Exception:
+        return DEFAULT_REPOS["repos"].copy()
+
+def repos_kaydet(repos: List[Dict]):
+    Path(CONFIG_DIR).mkdir(parents=True, exist_ok=True)
+    with open(REPOS_FILE, "w") as f:
+        json.dump({"repos": repos}, f, indent=2, ensure_ascii=False)
+
+def aktif_repolar() -> List[Dict]:
+    repos = repos_yukle()
+    aktif = [r for r in repos if r.get("enabled", True)]
+    aktif.sort(key=lambda r: r.get("priority", 0), reverse=True)
+    return aktif
+
+CFG = config_yukle()
+
+# ══════════════════════════════════════════════════════════════════
+# DİL SİSTEMİ (i18n)
+# ══════════════════════════════════════════════════════════════════
+
+I18N = {
+    "tr": {
+        "repo_updating": "Repo indexi güncelleniyor...",
+        "repo_updated": "Repo güncellendi",
+        "packages": "paket",
+        "already_installed": "Zaten kurulu",
+        "not_installed": "Kurulu değil",
+        "installing": "Kuruluyor",
+        "removing": "Kaldırılıyor",
+        "upgrading": "Güncelleniyor",
+        "downloading": "İndiriliyor",
+        "verifying": "Doğrulanıyor",
+        "configuring": "Yapılandırılıyor",
+        "db_updating": "Veritabanı güncelleniyor",
+        "all_uptodate": "Tüm paketler güncel.",
+        "install_confirm": "Kurulum yapılsın mı?",
+        "remove_confirm": "Silme işlemi yapılsın mı?",
+        "upgrade_confirm": "Güncelleme yapılsın mı?",
+        "cancelled": "İptal edildi.",
+        "root_required": "Root yetkisi gerekli. 'sudo nux' ile çalıştırın.",
+        "pkg_not_found": "Paket bulunamadı",
+        "dep_not_found": "Bağımlılık bulunamadı",
+        "dep_satisfied": "Bağımlılık sistemde",
+        "download_error": "İndirme hatası",
+        "checksum_ok": "SHA256 doğrulandı",
+        "checksum_fail": "Checksum uyuşmazlığı",
+        "install_done": "kuruldu",
+        "install_fail": "kurulamadı",
+        "remove_done": "Silindi",
+        "upgrade_done": "Güncellendi",
+        "upgrade_fail": "Başarısız",
+        "rollback_msg": "Rollback yapılıyor...",
+        "rollback_done": "Rollback tamamlandı",
+        "rollback_ask": "Rollback yapılsın mı?",
+        "total": "Toplam",
+        "installed_size": "Kurulu boyut",
+        "download_size": "İndirilecek",
+        "est_time": "Tahmini süre",
+        "pre_install": "Pre-install çalıştırılıyor...",
+        "post_install": "Post-install çalıştırılıyor...",
+        "system_updating": "Sistem veritabanları güncelleniyor...",
+        "cache_clean": "Önbellek zaten temiz.",
+        "cache_cleaned": "Önbellek temizlendi.",
+        "no_packages": "Kurulu paket yok.",
+        "no_history": "Geçmiş yok.",
+        "db_clean": "Veritabanı temiz.",
+        "db_empty": "Veritabanı boş.",
+        "healthy": "Tüm dosyalar sağlıklı.",
+        "all_healthy": "Tüm paketler sağlıklı.",
+        "pinned": "Pinlendi",
+        "unpinned": "Pin kaldırıldı",
+        "already_pinned": "Zaten pinli",
+        "not_pinned": "Pinli değil",
+        "protected_pkg": "Korumalı paket",
+        "pinned_pkg": "Pinli paket",
+        "auto_marked": "Auto olarak işaretlendi",
+        "manual_marked": "Manuel olarak işaretlendi",
+        "scan_system": "Sistem taranıyor...",
+        "sync_system": "Sistem senkronlanıyor...",
+        "adopted": "Tanındı",
+        "snapshot_created": "Snapshot oluşturuldu",
+        "snapshot_restored": "Snapshot restore tamamlandı",
+        "no_snapshots": "Hiç snapshot yok.",
+        "exported": "paket listelendi.",
+        "repo_added": "Repo eklendi",
+        "repo_removed": "Repo kaldırıldı",
+        "repo_enabled": "Repo etkinleştirildi",
+        "repo_disabled": "Repo devre dışı bırakıldı",
+        "repo_not_found": "Repo bulunamadı",
+        "repo_exists": "Repo zaten mevcut",
+        "connection_ok": "Bağlantı başarılı",
+        "connection_fail": "Bağlantı başarısız",
+        "doctor_title": "NUX SİSTEM SAĞLIK KONTROLÜ",
+        "doctor_db": "Veritabanı",
+        "doctor_repo": "Repo erişimi",
+        "doctor_cache": "Cache",
+        "doctor_lock": "Lock",
+        "doctor_files": "Dosya bütünlüğü",
+        "doctor_orphan": "Orphan paketler",
+        "doctor_class": "Sınıf dağılımı",
+        "doctor_healthy": "Sistem sağlıklı!",
+        "doctor_issues": "sorun tespit edildi.",
+        "why_installed": "kurulu çünkü",
+        "why_manual": "Manuel olarak kurulmuş",
+        "why_auto": "Bağımlılık olarak kurulmuş (otomatik)",
+        "why_depends": "Bağımlı paketler",
+        "size_title": "DİSK KULLANIM RAPORU",
+        "config_title": "NUX YAPILANDIRMA",
+        "config_lang": "Dil",
+        "config_theme": "Tema",
+        "config_spinner": "Spinner Stili",
+        "config_animation": "Kurulum Animasyonu",
+        "config_progress": "Progress Bar Stili",
+        "config_repo": "Repo URL",
+        "config_about": "Hakkında",
+        "config_back": "Geri",
+        "config_select": "Seçiminiz",
+        "config_saved": "Ayarlar kaydedildi.",
+        "about_dev": "Nux and Nucora are fully developed and maintained by one person.",
+        "about_by": "By: Efe Enes",
+        "about_motto": "Not difficult — just time, patience, and persistence.",
+        "about_infra": "All Nucora servers, repositories, forum and infrastructure are built and maintained by one person.",
+        "upgradable_pkgs": "GÜNCELLENECEK PAKETLER",
+        "install_pkgs": "KURULACAK PAKETLER",
+        "remove_pkgs": "SİLİNECEK PAKETLER",
+        "local_install": "YEREL KURULUM",
+        "repo_list_title": "KAYITLI REPOLAR",
+        "from_repo": "Kaynak",
+    },
+    "en": {
+        "repo_updating": "Updating repository index...",
+        "repo_updated": "Repository updated",
+        "packages": "packages",
+        "already_installed": "Already installed",
+        "not_installed": "Not installed",
+        "installing": "Installing",
+        "removing": "Removing",
+        "upgrading": "Upgrading",
+        "downloading": "Downloading",
+        "verifying": "Verifying",
+        "configuring": "Configuring",
+        "db_updating": "Updating database",
+        "all_uptodate": "All packages are up to date.",
+        "install_confirm": "Proceed with installation?",
+        "remove_confirm": "Proceed with removal?",
+        "upgrade_confirm": "Proceed with upgrade?",
+        "cancelled": "Cancelled.",
+        "root_required": "Root privileges required. Run with 'sudo nux'.",
+        "pkg_not_found": "Package not found",
+        "dep_not_found": "Dependency not found",
+        "dep_satisfied": "Dependency satisfied by system",
+        "download_error": "Download error",
+        "checksum_ok": "SHA256 verified",
+        "checksum_fail": "Checksum mismatch",
+        "install_done": "installed",
+        "install_fail": "installation failed",
+        "remove_done": "Removed",
+        "upgrade_done": "Upgraded",
+        "upgrade_fail": "Failed",
+        "rollback_msg": "Rolling back...",
+        "rollback_done": "Rollback complete",
+        "rollback_ask": "Rollback?",
+        "total": "Total",
+        "installed_size": "Installed size",
+        "download_size": "Download size",
+        "est_time": "Estimated time",
+        "pre_install": "Running pre-install...",
+        "post_install": "Running post-install...",
+        "system_updating": "Updating system databases...",
+        "cache_clean": "Cache is already clean.",
+        "cache_cleaned": "Cache cleaned.",
+        "no_packages": "No installed packages.",
+        "no_history": "No history.",
+        "db_clean": "Database is clean.",
+        "db_empty": "Database is empty.",
+        "healthy": "All files are healthy.",
+        "all_healthy": "All packages are healthy.",
+        "pinned": "Pinned",
+        "unpinned": "Unpinned",
+        "already_pinned": "Already pinned",
+        "not_pinned": "Not pinned",
+        "protected_pkg": "Protected package",
+        "pinned_pkg": "Pinned package",
+        "auto_marked": "Marked as auto",
+        "manual_marked": "Marked as manual",
+        "scan_system": "Scanning system...",
+        "sync_system": "Syncing system...",
+        "adopted": "Adopted",
+        "snapshot_created": "Snapshot created",
+        "snapshot_restored": "Snapshot restore complete",
+        "no_snapshots": "No snapshots.",
+        "exported": "packages listed.",
+        "repo_added": "Repository added",
+        "repo_removed": "Repository removed",
+        "repo_enabled": "Repository enabled",
+        "repo_disabled": "Repository disabled",
+        "repo_not_found": "Repository not found",
+        "repo_exists": "Repository already exists",
+        "connection_ok": "Connection successful",
+        "connection_fail": "Connection failed",
+        "doctor_title": "NUX SYSTEM HEALTH CHECK",
+        "doctor_db": "Database",
+        "doctor_repo": "Repo access",
+        "doctor_cache": "Cache",
+        "doctor_lock": "Lock",
+        "doctor_files": "File integrity",
+        "doctor_orphan": "Orphan packages",
+        "doctor_class": "Class distribution",
+        "doctor_healthy": "System is healthy!",
+        "doctor_issues": "issues detected.",
+        "why_installed": "is installed because",
+        "why_manual": "Manually installed",
+        "why_auto": "Installed as dependency (automatic)",
+        "why_depends": "Dependent packages",
+        "size_title": "DISK USAGE REPORT",
+        "config_title": "NUX CONFIGURATION",
+        "config_lang": "Language",
+        "config_theme": "Theme",
+        "config_spinner": "Spinner Style",
+        "config_animation": "Install Animation",
+        "config_progress": "Progress Bar Style",
+        "config_repo": "Repo URL",
+        "config_about": "About",
+        "config_back": "Back",
+        "config_select": "Your choice",
+        "config_saved": "Settings saved.",
+        "about_dev": "Nux and Nucora are fully developed and maintained by one person.",
+        "about_by": "By: Efe Enes",
+        "about_motto": "Not difficult — just time, patience, and persistence.",
+        "about_infra": "All Nucora servers, repositories, forum and infrastructure are built and maintained by one person.",
+        "upgradable_pkgs": "UPGRADEABLE PACKAGES",
+        "install_pkgs": "PACKAGES TO INSTALL",
+        "remove_pkgs": "PACKAGES TO REMOVE",
+        "local_install": "LOCAL INSTALL",
+        "repo_list_title": "REGISTERED REPOSITORIES",
+        "from_repo": "Source",
+    },
+}
+
+def tr(key: str, **kwargs) -> str:
+    lang = CFG.get("language", "tr")
+    text = I18N.get(lang, I18N["tr"]).get(key, key)
+    if kwargs:
+        try:
+            return text.format(**kwargs)
+        except Exception:
+            return text
+    return text
+
+# ══════════════════════════════════════════════════════════════════
+# RENKLER VE TEMA
+# ══════════════════════════════════════════════════════════════════
+
+THEMES = {
+    "default": {
+        "R": "\033[1;31m", "G": "\033[1;32m", "Y": "\033[1;33m",
+        "C": "\033[1;36m", "W": "\033[1;37m", "M": "\033[1;35m",
+        "B": "\033[1;34m", "DIM": "\033[2m", "RE": "\033[0m",
+    },
+    "minimal": {
+        "R": "\033[31m", "G": "\033[32m", "Y": "\033[33m",
+        "C": "\033[36m", "W": "\033[37m", "M": "\033[35m",
+        "B": "\033[34m", "DIM": "\033[2m", "RE": "\033[0m",
+    },
+    "neon": {
+        "R": "\033[1;91m", "G": "\033[1;92m", "Y": "\033[1;93m",
+        "C": "\033[1;96m", "W": "\033[1;97m", "M": "\033[1;95m",
+        "B": "\033[1;94m", "DIM": "\033[2m", "RE": "\033[0m",
+    },
+    "pastel": {
+        "R": "\033[91m", "G": "\033[92m", "Y": "\033[93m",
+        "C": "\033[96m", "W": "\033[97m", "M": "\033[95m",
+        "B": "\033[94m", "DIM": "\033[2m", "RE": "\033[0m",
+    },
+}
+
+def get_theme():
+    theme_name = CFG.get("theme", "default")
+    return THEMES.get(theme_name, THEMES["default"])
+
+T = get_theme()
+R, G, Y, C, W, M, B, DIM, RE = T["R"], T["G"], T["Y"], T["C"], T["W"], T["M"], T["B"], T["DIM"], T["RE"]
+
+CLASS_COLORS = {"app": G, "base": Y, "tool": M}
+CLASS_LABELS = {"app": "[APP]", "base": "[BASE]", "tool": "[TOOL]"}
+
+def renkli(msg, renk): return f"{renk}{msg}{RE}"
+def class_badge(cls):
+    color = CLASS_COLORS.get(cls, W)
+    label = CLASS_LABELS.get(cls, f"[{cls.upper()}]")
+    return f"{color}{label}{RE}"
+
+# ══════════════════════════════════════════════════════════════════
+# SPINNER
+# ══════════════════════════════════════════════════════════════════
+
+SPINNERS = {
+    "braille": ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"],
+    "dots": ["⣾","⣽","⣻","⢿","⡿","⣟","⣯","⣷"],
+    "arrow": ["←","↖","↑","↗","→","↘","↓","↙"],
+    "pulse": ["░","▒","▓","█","▓","▒","░"],
+}
+
+class Spinner:
+    def __init__(self, msg=""):
+        spinner_type = CFG.get("spinner", "braille")
+        self.frames = SPINNERS.get(spinner_type, SPINNERS["braille"])
+        self.msg = msg
+        self._stop = False
+        self._thread = None
+
+    def _spin(self):
+        i = 0
+        while not self._stop:
+            frame = self.frames[i % len(self.frames)]
+            sys.stdout.write(f"\r  {C}{frame}{RE} {self.msg}")
+            sys.stdout.flush()
+            time.sleep(0.08)
+            i += 1
+        sys.stdout.write(f"\r  {G}✓{RE} {self.msg}  \n")
+        sys.stdout.flush()
+
+    def start(self):
+        self._stop = False
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop = True
+        if self._thread:
+            self._thread.join(timeout=1)
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stop()
+
+# ══════════════════════════════════════════════════════════════════
+# PROGRESS BAR
+# ══════════════════════════════════════════════════════════════════
+
+class ProgressBar:
+    def __init__(self, total, desc="", toplam_adim=1, mevcut_adim=1):
+        self.total = total
+        self.desc = desc
+        self.toplam_adim = toplam_adim
+        self.mevcut_adim = mevcut_adim
+        self.downloaded = 0
+        self._start = time.monotonic()
+        self._last_time = self._start
+        self._last_bytes = 0
+        self._speed = 0.0
+        self._style = CFG.get("progress_style", "detailed")
+
+    def update(self, chunk):
+        self.downloaded += len(chunk)
+        now = time.monotonic()
+        elapsed = now - self._last_time
+        if elapsed >= 0.1:
+            delta = self.downloaded - self._last_bytes
+            speed = delta / elapsed / 1024 / 1024
+            self._speed = speed if self._speed == 0 else 0.3 * speed + 0.7 * self._speed
+            self._last_time = now
+            self._last_bytes = self.downloaded
+        self.draw()
+
+    def draw(self):
+        if self.total <= 0:
+            return
+        ratio = min(self.downloaded / self.total, 1.0)
+        pct = int(ratio * 100)
+
+        if self._style == "minimal":
+            sys.stdout.write(f"\r  {C}[↓]{RE} {self.desc} {W}{pct}%{RE}  ")
+        elif self._style == "simple":
+            filled = int(30 * ratio)
+            bar = "█" * filled + "░" * (30 - filled)
+            sys.stdout.write(f"\r  {C}[↓]{RE} {self.desc} [{G}{bar}{RE}] {W}{pct}%{RE}  ")
+        else:
+            filled = int(35 * ratio)
+            bar = "█" * filled + "░" * (35 - filled)
+            mb_d = self.downloaded / 1024 / 1024
+            mb_t = self.total / 1024 / 1024
+            spd = f"{self._speed:.1f} MB/s" if self._speed > 0 else "..."
+            remaining = ""
+            if self._speed > 0:
+                left = (self.total - self.downloaded) / (self._speed * 1024 * 1024)
+                if left < 60:
+                    remaining = f" ~{int(left)}s"
+                else:
+                    remaining = f" ~{int(left/60)}m"
+            adim = f"{DIM}[{self.mevcut_adim}/{self.toplam_adim}]{RE} " if self.toplam_adim > 1 else ""
+            sys.stdout.write(
+                f"\r{adim}{C}[↓]{RE} {self.desc} "
+                f"[{G}{bar}{RE}] {W}{pct}%{RE} "
+                f"{DIM}{mb_d:.1f}/{mb_t:.1f}MB{RE} "
+                f"{Y}{spd}{RE}{remaining}  "
+            )
+        sys.stdout.flush()
+
+    def finish(self):
+        elapsed = time.monotonic() - self._start
+        mb = self.downloaded / 1024 / 1024
+        spd = f"{mb/elapsed:.1f} MB/s" if elapsed > 0 else "?"
+        sys.stdout.write(f"\r{G}[✓]{RE} {self.desc}  {W}{mb:.1f} MB{RE} {Y}{spd}{RE}      \n")
+        sys.stdout.flush()
+
+# ══════════════════════════════════════════════════════════════════
+# ADIM GÖSTERGESİ
+# ══════════════════════════════════════════════════════════════════
+
+def adim_goster(adim, toplam, mesaj, durum="active"):
+    style = CFG.get("install_animation", "stepped")
+    if style == "stepped":
+        if durum == "done":
+            icon = f"{G}✅{RE}"
+        elif durum == "active":
+            icon = f"{C}●{RE}"
+        else:
+            icon = f"{DIM}○{RE}"
+        print(f"  {icon} {mesaj}")
+    elif style == "classic":
+        print(f"  {DIM}[{adim}/{toplam}]{RE} {C}{mesaj}{RE}")
+    else:
+        print(f"  {Y}[{adim}/{toplam}]{RE} {mesaj}")
+
+# ══════════════════════════════════════════════════════════════════
+# TEMEL YARDIMCILAR
+# ══════════════════════════════════════════════════════════════════
+
+class LockError(Exception):
+    pass
+
+def cmd_env():
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    env["LANG"] = "C"
+    env["LANGUAGE"] = "C"
+    return env
+
+def ensure_dirs():
+    for d in ["/var/lib/nux", CACHE_DIR, "/var/log", "/var/lock",
+              SCRIPTS_ROOT, SNAPSHOT_DIR, INDEX_CACHE_DIR, CONFIG_DIR]:
+        Path(d).mkdir(parents=True, exist_ok=True)
+
+def log(msg, prefix="[*]", renk=W, force=False):
+    if not QUIET or force:
+        print(renkli(f"{prefix} {msg}", renk))
+    try:
+        ensure_dirs()
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {prefix} {msg}\n")
+    except Exception:
+        pass
+
+def basari(msg): log(msg, "[✓]", G)
+def bilgi(msg): log(msg, "[*]", C)
+def uyari(msg): log(msg, "[!]", Y)
+def hata(msg):
+    log(msg, "[✗]", R, force=True)
+    return 1
+
+def debug(msg):
+    if VERBOSE:
+        print(renkli(f"[DBG] {msg}", DIM))
+
+def root_kontrol():
+    if os.geteuid() != 0:
+        return hata(tr("root_required"))
+    return 0
+
+def onayla(msg):
+    if ASSUME_YES:
+        return True
+    try:
+        cevap = input(renkli(f"[?] {msg} [E/h]: ", Y)).lower().strip()
+        return cevap in ("", "e", "evet", "y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+def acquire_lock():
+    if Path(LOCK_FILE).exists():
+        pid = Path(LOCK_FILE).read_text().strip()
+        if pid == str(os.getpid()):
+            return
+        if pid and Path(f"/proc/{pid}").exists():
+            raise LockError(f"Başka bir nux işlemi çalışıyor (PID: {pid})")
+    ensure_dirs()
+    Path(LOCK_FILE).write_text(str(os.getpid()))
+
+def release_lock():
+    Path(LOCK_FILE).unlink(missing_ok=True)
+
+def sha256_hash(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(b)
+    return h.hexdigest()
+
+def boyut_formatla(bayt) -> str:
+    try:
+        bayt = int(bayt)
+    except Exception:
+        return str(bayt)
+    if bayt < 1024: return f"{bayt} B"
+    elif bayt < 1024**2: return f"{bayt/1024:.1f} KB"
+    elif bayt < 1024**3: return f"{bayt/1024/1024:.1f} MB"
+    return f"{bayt/1024/1024/1024:.1f} GB"
+
+def sure_tahmin(bayt):
+    sure = bayt / (3 * 1024 * 1024)
+    if sure < 10: return "~10s"
+    elif sure < 60: return f"~{int(sure)}s"
+    else: return f"~{int(sure/60)}m"
+
+# ══════════════════════════════════════════════════════════════════
+# VERSİYON KARŞILAŞTIRMA
+# ══════════════════════════════════════════════════════════════════
+
+def versiyon_karsilastir(v1, v2):
+    try:
+        if subprocess.run(["dpkg","--compare-versions",v1,"lt",v2],
+                         capture_output=True, env=cmd_env()).returncode == 0:
+            return -1
+        if subprocess.run(["dpkg","--compare-versions",v1,"gt",v2],
+                         capture_output=True, env=cmd_env()).returncode == 0:
+            return 1
+        return 0
+    except Exception:
+        return -1 if v1 < v2 else (1 if v1 > v2 else 0)
+
+# ══════════════════════════════════════════════════════════════════
+# PAKET ADI VE SINIF
+# ══════════════════════════════════════════════════════════════════
+
+def gecerli_paket_adi(name): return bool(name and PKG_NAME_RE.fullmatch(name))
+def gecersiz_db_kayitlari(db): return [n for n in db if not gecerli_paket_adi(n)]
+
+def is_tool_package(name):
+    if name in TOOL_PACKAGES: return True
+    return any(name.startswith(p) for p in TOOL_PREFIXES)
+
+def paket_sinifi(meta): return meta.get("class", "app")
+def paket_yoneticisi(meta): return meta.get("managed_by", "nux")
+
+def gecerli_versiyon(ver):
+    return bool(ver and re.match(r'^[0-9]', ver))
+
+def db_versiyon_kontrol(name, meta):
+    ver = meta.get("version", "0")
+    if not gecerli_versiyon(ver):
+        try:
+            result = subprocess.run(
+                ["dpkg-query","-W","-f=${Version}","--",name],
+                capture_output=True, text=True, timeout=5, env=cmd_env()
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                dpkg_ver = result.stdout.strip()
+                if gecerli_versiyon(dpkg_ver):
+                    meta["version"] = dpkg_ver
+                    return dpkg_ver
+        except Exception:
+            pass
+        return "0"
+    return ver
+
+# ══════════════════════════════════════════════════════════════════
+# DB İŞLEMLERİ
+# ══════════════════════════════════════════════════════════════════
+
+def db_yukle():
+    try:
+        with open(KURULU_DB) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def db_kaydet(db):
+    ensure_dirs()
+    tmp = Path(KURULU_DB + ".tmp")
+    tmp.write_text(json.dumps(db, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(str(tmp), KURULU_DB)
+
+def db_yedekle():
+    db = db_yukle()
+    yedek = f"{KURULU_DB}.backup.{int(datetime.now().timestamp())}"
+    with open(yedek, "w") as f:
+        json.dump(db, f, indent=2, ensure_ascii=False)
+    return yedek
+
+# ══════════════════════════════════════════════════════════════════
+# PIN
+# ══════════════════════════════════════════════════════════════════
+
+def pin_yukle():
+    try:
+        with open(PIN_FILE) as f: return json.load(f)
+    except Exception:
+        return []
+
+def pin_kaydet(pins):
+    ensure_dirs()
+    with open(PIN_FILE, "w") as f:
+        json.dump(pins, f, indent=2, ensure_ascii=False)
+
+def pin_ekle(pkgs):
+    pins = pin_yukle()
+    for p in pkgs:
+        if p not in pins: pins.append(p); basari(f"{tr('pinned')}: {p}")
+        else: uyari(f"{tr('already_pinned')}: {p}")
+    pin_kaydet(pins)
+
+def pin_kaldir(pkgs):
+    pins = pin_yukle()
+    for p in pkgs:
+        if p in pins: pins.remove(p); basari(f"{tr('unpinned')}: {p}")
+        else: uyari(f"{tr('not_pinned')}: {p}")
+    pin_kaydet(pins)
+
+# ══════════════════════════════════════════════════════════════════
+# REPO İŞLEMLERİ (ÇOKLU REPO)
+# ══════════════════════════════════════════════════════════════════
+
+def repo_index_path(repo_name):
+    return f"{INDEX_CACHE_DIR}/{repo_name}.json"
+
+def repo_getir(repo_name=None):
+    if repo_name:
+        cache_path = Path(repo_index_path(repo_name))
+    else:
+        repos = aktif_repolar()
+        if not repos:
+            return None
+        cache_path = Path(repo_index_path(repos[0]["name"]))
+
+    if cache_path.exists():
+        age = datetime.now().timestamp() - cache_path.stat().st_mtime
+        if age < 3600:
+            try:
+                with open(cache_path) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+    return None
+
+def repo_getir_birlesik():
+    merged = {"packages": {}, "package_count": 0, "version_count": 0}
+    for repo in aktif_repolar():
+        index = repo_getir(repo["name"])
+        if not index:
+            continue
+        for name, pdata in index.get("packages", {}).items():
+            if name not in merged["packages"]:
+                merged["packages"][name] = pdata
+                merged["packages"][name]["_repo"] = repo["name"]
+                merged["packages"][name]["_repo_url"] = repo["url"]
+            else:
+                existing_repo_priority = 0
+                for r in aktif_repolar():
+                    if r["name"] == merged["packages"][name].get("_repo"):
+                        existing_repo_priority = r.get("priority", 0)
+                        break
+                if repo.get("priority", 0) > existing_repo_priority:
+                    merged["packages"][name] = pdata
+                    merged["packages"][name]["_repo"] = repo["name"]
+                    merged["packages"][name]["_repo_url"] = repo["url"]
+    merged["package_count"] = len(merged["packages"])
+    return merged
+
+def update():
+    bilgi(tr("repo_updating"))
+    repos = aktif_repolar()
+    if not repos:
+        repos = DEFAULT_REPOS["repos"]
+        repos_kaydet(repos)
+
+    toplam = 0
+    for repo in repos:
+        repo_url = repo["url"].rstrip("/")
+        index_url = f"{repo_url}/index.json"
+        cache_path = repo_index_path(repo["name"])
+
+        try:
+            req = urllib.request.Request(index_url, headers={
+                "Accept-Encoding": "gzip",
+                "User-Agent": f"nux/{CLIENT_VERSION}"
+            })
+            with urllib.request.urlopen(req, timeout=60) as response:
+                data = response.read()
+                if response.headers.get("Content-Encoding") == "gzip":
+                    data = gzip.decompress(data)
+                ensure_dirs()
+                with open(cache_path, "wb") as f:
+                    f.write(data)
+                index = json.loads(data)
+                count = index.get("package_count", 0)
+                toplam += count
+                basari(f"{tr('repo_updated')}: {repo['name']} ({count} {tr('packages')})")
+        except urllib.error.URLError as e:
+            uyari(f"{repo['name']}: {e}")
+        except Exception as e:
+            uyari(f"{repo['name']}: {e}")
+
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# DEPENDENCY YARDIMCILARI
+# ══════════════════════════════════════════════════════════════════
+
+def dep_temizle(dep):
+    dep = dep.split("|", 1)[0].strip()
+    dep = re.sub(r"\s*\(.*?\)", "", dep).strip()
+    dep = re.sub(r"\s*\[.*?\]", "", dep).strip()
+    dep = re.sub(r":[A-Za-z0-9_-]+$", "", dep).strip()
+    return dep
+
+def dep_alternatifleri(dep):
+    sonuc = []
+    for alt in dep.split("|"):
+        alt = alt.strip()
+        alt = re.sub(r"\s*\(.*?\)", "", alt).strip()
+        alt = re.sub(r"\s*\[.*?\]", "", alt).strip()
+        alt = re.sub(r":[A-Za-z0-9_-]+$", "", alt).strip()
+        if alt and gecerli_paket_adi(alt):
+            sonuc.append(alt)
+    return sonuc
+
+def bagimlilik_yoksay(name):
+    if name in IGNORED_DEPS: return True
+    return any(name.endswith(s) for s in IGNORED_DEP_SUFFIXES)
+
+_dpkg_cache = {}
+
+def _dpkg_kurulu_mu(name):
+    if name in _dpkg_cache: return _dpkg_cache[name]
+    try:
+        result = subprocess.run(
+            ["dpkg-query","-W","-f=${Status}","--",name],
+            capture_output=True, text=True, timeout=5, env=cmd_env()
+        )
+        kurulu = result.returncode == 0 and "install ok installed" in result.stdout
+        _dpkg_cache[name] = kurulu
+        return kurulu
+    except Exception:
+        _dpkg_cache[name] = False
+        return False
+
+def _dpkg_provides_kontrol(name):
+    try:
+        result = subprocess.run(
+            ["dpkg-query","-W","-f=${Package}\t${Provides}\t${Status}\n"],
+            capture_output=True, text=True, timeout=10, env=cmd_env()
+        )
+        if result.returncode != 0: return False
+        for line in result.stdout.splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) < 3: continue
+            if "install ok installed" not in parts[2]: continue
+            if parts[1]:
+                for prov in parts[1].split(","):
+                    if prov.strip().split(" ",1)[0].strip() == name:
+                        _dpkg_cache[name] = True
+                        return True
+        return False
+    except Exception:
+        return False
+
+def sistemde_paket_var(name):
+    if bagimlilik_yoksay(name): return True
+    if shutil.which(name): return True
+    if _dpkg_kurulu_mu(name): return True
+    if not name.endswith("t64") and _dpkg_kurulu_mu(name + "t64"): return True
+    if _dpkg_provides_kontrol(name): return True
+    return False
+
+def dep_karsilaniyor_mu(dep_expr, db):
+    for alt in dep_alternatifleri(dep_expr):
+        if bagimlilik_yoksay(alt): return True
+        if alt in db: return True
+        for pn, pm in db.items():
+            if alt in pm.get("provides", []): return True
+        if sistemde_paket_var(alt): return True
+    name = dep_temizle(dep_expr)
+    if name and bagimlilik_yoksay(name): return True
+    if name and sistemde_paket_var(name): return True
+    return False
+
+def dep_karsilaniyor_mu_haric(dep_expr, db, haric):
+    for alt in dep_alternatifleri(dep_expr):
+        if bagimlilik_yoksay(alt): return True
+        for pn, pm in db.items():
+            if pn in haric: continue
+            if pn == alt or alt in pm.get("provides", []): return True
+        if sistemde_paket_var(alt): return True
+    name = dep_temizle(dep_expr)
+    if name and bagimlilik_yoksay(name): return True
+    if name and sistemde_paket_var(name): return True
+    return False
+
+def secili_kurulu_provider(dep_expr, db):
+    for alt in dep_alternatifleri(dep_expr):
+        if alt in db: return alt
+        for pn, pm in db.items():
+            if alt in pm.get("provides", []): return pn
+    return None
+
+def cozum_mesaji_uret(name, gerekli=None):
+    lines = []
+    if gerekli:
+        lines.append(f"{tr('dep_not_found')}: {name}")
+        lines.append(f"    {gerekli}")
+    else:
+        lines.append(f"{tr('pkg_not_found')}: {name}")
+    lines.append(f"\n  {Y}nux search {name}{RE}")
+    return "\n".join(lines)
+
+# ══════════════════════════════════════════════════════════════════
+# SİSTEM GÜNCELLEME
+# ══════════════════════════════════════════════════════════════════
+
+def sistem_guncelle():
+    for cmd in [
+        ["ldconfig"],
+        ["update-desktop-database","/usr/share/applications"],
+        ["gtk-update-icon-cache","-f","-t","/usr/share/icons/hicolor"],
+        ["update-mime-database","/usr/share/mime"],
+        ["glib-compile-schemas","/usr/share/glib-2.0/schemas"],
+    ]:
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=cmd_env())
+        except Exception:
+            pass
+
+def safe_extract(tar, path):
+    base = os.path.realpath(path)
+    for member in tar.getmembers():
+        target = os.path.realpath(os.path.join(path, member.name))
+        if not target.startswith(base + os.sep) and target != base:
+            raise Exception(f"Güvensiz tar yolu: {member.name}")
+    tar.extractall(path)
+
+# ══════════════════════════════════════════════════════════════════
+# BENZERLİK ÖNERİSİ
+# ══════════════════════════════════════════════════════════════════
+
+def benzer_paket_oner(sorgu, index, limit=5):
+    paketler = index.get("packages", {})
+    skorlar = []
+    s = sorgu.lower()
+    for ad in paketler:
+        a = ad.lower()
+        if a.startswith(s): skor = 50
+        elif s in a: skor = 30
+        else:
+            idx = 0
+            skor = 0
+            for ch in s:
+                pos = a.find(ch, idx)
+                if pos == -1: skor = 0; break
+                idx = pos + 1
+                skor = 10
+        if skor > 0:
+            skorlar.append((skor, ad))
+    skorlar.sort(key=lambda x: (-x[0], x[1]))
+    return [ad for _, ad in skorlar[:limit]]
+
+def _oneri_goster(sorgu, index):
+    adaylar = benzer_paket_oner(sorgu, index)
+    if not adaylar:
+        print(renkli(f"\n  '{sorgu}' {tr('pkg_not_found')}.\n", Y))
+        return
+    print(renkli(f"\n  '{sorgu}' {tr('pkg_not_found')}:\n", Y))
+    for i, ad in enumerate(adaylar, 1):
+        print(f"    {C}{i}.{RE} {G}{ad}{RE}")
+    print(f"\n  {C}nux install <paket>{RE}\n")
+
+# ══════════════════════════════════════════════════════════════════
+# SCRIPT RUNNER
+# ══════════════════════════════════════════════════════════════════
+
+def run_pkg_script(script, pkg_name, script_name, args=None, meta=None, fatal=True):
+    if not script.exists(): return True
+    args = args or []
+    env = cmd_env()
+    env["DPKG_MAINTSCRIPT_PACKAGE"] = pkg_name
+    env["DPKG_MAINTSCRIPT_NAME"] = script_name
+    env["DPKG_ADMINDIR"] = "/var/lib/dpkg"
+    if meta and meta.get("architecture"):
+        env["DPKG_MAINTSCRIPT_ARCH"] = meta["architecture"]
+    try:
+        result = subprocess.run(
+            ["bash", str(script)] + args,
+            capture_output=True, text=True,
+            cwd=str(script.parent), env=env, timeout=300
+        )
+    except Exception as e:
+        if fatal: hata(f"{script_name} ({pkg_name}): {e}")
+        return False
+    if result.returncode != 0:
+        msg = result.stderr.strip()[:150] or f"exit {result.returncode}"
+        if fatal: hata(f"{script_name} ({pkg_name}): {msg}")
+        return False
+    return True
+
+# ══════════════════════════════════════════════════════════════════
+# BAĞIMLILIK ÇÖZÜCÜ
+# ══════════════════════════════════════════════════════════════════
+
+class DependencyResolver:
+    def __init__(self, index, db):
+        self.index = index or {}
+        self.db = db or {}
+        self.packages = self.index.get("packages", {})
+
+    def get_package_info(self, name):
+        if name in self.packages:
+            pkg = self.packages[name]
+            latest = pkg.get("latest")
+            if latest and latest in pkg.get("versions", {}):
+                info = pkg["versions"][latest].copy()
+                info["_repo"] = pkg.get("_repo", "unknown")
+                info["_repo_url"] = pkg.get("_repo_url", "")
+                return info
+        return None
+
+    def installed_provider(self, name):
+        if name in self.db: return name
+        for pn, pm in self.db.items():
+            if name in pm.get("provides", []): return pn
+        return None
+
+    def repo_provider(self, name):
+        if name in self.packages: return name
+        for pn, pd in self.packages.items():
+            latest = pd.get("latest")
+            if not latest: continue
+            info = pd.get("versions", {}).get(latest, {})
+            if name in info.get("provides", []): return pn
+        return None
+
+    def satisfies_dep(self, dep):
+        return dep_karsilaniyor_mu(dep, self.db)
+
+    def repo_provider_for_dep(self, dep):
+        for alt in dep_alternatifleri(dep):
+            if bagimlilik_yoksay(alt): return None
+            if self.installed_provider(alt) or sistemde_paket_var(alt): return None
+            provider = self.repo_provider(alt)
+            if provider: return provider
+        name = dep_temizle(dep)
+        if name and not bagimlilik_yoksay(name):
+            if not self.installed_provider(name) and not sistemde_paket_var(name):
+                return self.repo_provider(name)
+        return None
+
+    def coz(self, pkgs, ziyaret=None):
+        if ziyaret is None: ziyaret = set()
+        kurulacak, bilgiler = [], {}
+        for pkg in pkgs:
+            if pkg in ziyaret: continue
+            ziyaret.add(pkg)
+            if pkg in self.db: continue
+            provider = self.repo_provider(pkg)
+            if not provider:
+                if sistemde_paket_var(pkg):
+                    debug(f"{tr('dep_satisfied')}: {pkg}")
+                    continue
+                raise ValueError(cozum_mesaji_uret(pkg))
+            info = self.get_package_info(provider)
+            if not info:
+                raise ValueError(f"{tr('pkg_not_found')}: {provider}")
+            for dep in info.get("depends", []):
+                if self.satisfies_dep(dep): continue
+                dp = self.repo_provider_for_dep(dep)
+                if dp:
+                    if dp not in self.db:
+                        sl, si = self.coz([dp], ziyaret)
+                        kurulacak.extend(sl)
+                        bilgiler.update(si)
+                elif dep_karsilaniyor_mu(dep, self.db):
+                    pass
+                else:
+                    alts = dep_alternatifleri(dep)
+                    dn = alts[0] if alts else dep_temizle(dep)
+                    raise ValueError(cozum_mesaji_uret(dn, provider))
+            if provider not in kurulacak:
+                kurulacak.append(provider)
+                bilgiler[provider] = info
+        return kurulacak, bilgiler
+
+# ══════════════════════════════════════════════════════════════════
+# DOSYA KURULUM
+# ══════════════════════════════════════════════════════════════════
+
+def _script_store(name): return Path(SCRIPTS_ROOT) / name
+
+def _scripts_kaydet(name, scripts_dir):
+    dst = _script_store(name)
+    shutil.rmtree(dst, ignore_errors=True)
+    if scripts_dir.exists():
+        shutil.copytree(scripts_dir, dst, symlinks=True)
+
+def _install_one_file(src, dest, files_base, tar_members):
+    rel_path = str(src.relative_to(files_base))
+    member_key = f"files/{rel_path}"
+    if src.is_dir():
+        dest.mkdir(parents=True, exist_ok=True)
+        member = tar_members.get(member_key)
+        if member:
+            try: os.chmod(dest, member.mode)
+            except Exception: pass
+        return None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if src.is_symlink():
+        target = os.readlink(src)
+        if dest.exists() or dest.is_symlink():
+            try:
+                if dest.is_dir() and not dest.is_symlink(): shutil.rmtree(dest)
+                else: dest.unlink()
+            except Exception: pass
+        os.symlink(target, dest)
+        return str(dest)
+    if not src.is_file(): return None
+    shutil.copy2(src, dest)
+    member = tar_members.get(member_key)
+    if member:
+        try: os.chmod(dest, member.mode)
+        except Exception: pass
+    return str(dest)
+
+# ══════════════════════════════════════════════════════════════════
+# PAKET KURULUM
+# ══════════════════════════════════════════════════════════════════
+
+def _pkg_kur(name, info, db, transaction,
+             toplam_adim=1, mevcut_adim=1,
+             auto_installed=False):
+    dosya_adi = info.get("filename", "")
+    repo_url = info.get("_repo_url", "")
+    repo_name = info.get("_repo", "unknown")
+
+    if not repo_url:
+        repos = aktif_repolar()
+        if repos:
+            repo_url = repos[0]["url"]
+
+    repo_url = repo_url.rstrip("/")
+    url = f"{repo_url}/{dosya_adi}"
+    cache_path = Path(CACHE_DIR) / Path(dosya_adi).name
+    basarili = False
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    adim_goster(1, 4, f"{tr('downloading')}: {name} ← {repo_name}")
+    if (not cache_path.exists()) or (
+        "sha256" in info and sha256_hash(str(cache_path)) != info["sha256"]
+    ):
+        progress = ProgressBar(int(info.get("size", 0)), name, toplam_adim, mevcut_adim)
+        if not indir(url, str(cache_path), name, progress):
+            return False
+    else:
+        bilgi(f"Cache: {name}")
+
+    adim_goster(2, 4, f"{tr('verifying')}...")
+    if "sha256" in info:
+        pkg_sha = sha256_hash(str(cache_path))
+        if pkg_sha != info["sha256"]:
+            hata(f"{tr('checksum_fail')}: {name}")
+            cache_path.unlink(missing_ok=True)
+            return False
+        basari(f"{tr('checksum_ok')}: {pkg_sha[:16]}...")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            tar_members = {}
+            with tarfile.open(str(cache_path), "r:*") as tar:
+                for member in tar.getmembers():
+                    tar_members[member.name] = member
+                safe_extract(tar, tmp)
+
+            meta_path = tmp / "metadata.json"
+            if not meta_path.exists():
+                return hata(f"metadata.json: {name}")
+
+            with open(meta_path) as f:
+                meta = json.load(f)
+
+            for dep in meta.get("pre_depends", []):
+                if not dep_karsilaniyor_mu(dep, db):
+                    return hata(f"Pre-depends: {dep}")
+
+            adim_goster(3, 4, f"{tr('installing')}: {name}")
+
+            eski_meta = db.get(name, {})
+            eski_versiyon = eski_meta.get("version")
+
+            pre = tmp / "scripts" / "pre-install.sh"
+            if pre.exists():
+                bilgi(tr("pre_install"))
+                pre_args = ["upgrade", eski_versiyon] if eski_versiyon else ["install"]
+                if not run_pkg_script(pre, name, "preinst", pre_args, meta=meta):
+                    return False
+
+            conffiles = []
+            conf_path = tmp / "control" / "conffiles"
+            if conf_path.exists():
+                conffiles = [l.strip() for l in open(conf_path) if l.strip()]
+
+            files_dir = tmp / "files"
+            if not files_dir.exists():
+                files_dir = tmp
+
+            _scripts_kaydet(name, tmp / "scripts")
+
+            kurulu_dosyalar = []
+            sha_map = {}
+
+            for src in sorted(files_dir.rglob("*")):
+                rel = src.relative_to(files_dir)
+                rel_str = str(rel)
+                if rel_str in ("metadata.json",): continue
+                if rel_str.startswith("scripts/") or rel_str.startswith("control/"): continue
+                dest = Path("/") / rel
+                kurulan = _install_one_file(src, dest, files_dir, tar_members)
+                if kurulan:
+                    kurulu_dosyalar.append(kurulan)
+                    if src.is_file() and not src.is_symlink():
+                        sha_map[kurulan] = sha256_hash(str(src))
+
+            post = tmp / "scripts" / "post-install.sh"
+            if post.exists():
+                bilgi(tr("post_install"))
+                post_args = ["configure", eski_versiyon] if eski_versiyon else ["configure"]
+                run_pkg_script(post, name, "postinst", post_args, meta=meta, fatal=False)
+
+            adim_goster(4, 4, f"{tr('db_updating')}...")
+
+            meta["files"] = kurulu_dosyalar
+            meta["sha256_files"] = sha_map
+            meta["install_date"] = datetime.now().isoformat()
+            meta["conffiles"] = conffiles
+            meta["managed_by"] = "nux"
+
+            if eski_meta:
+                meta["auto_installed"] = eski_meta.get("auto_installed", False)
+            else:
+                meta["auto_installed"] = auto_installed
+            meta["install_reason"] = "dependency" if meta["auto_installed"] else "manual"
+
+            if "class" not in meta:
+                if is_tool_package(name): meta["class"] = "tool"
+                elif auto_installed: meta["class"] = "base"
+                else: meta["class"] = "app"
+
+            meta["_installed_from_repo"] = repo_name
+
+            db[name] = meta
+            transaction.append(("INSTALL", name, meta))
+            basarili = True
+
+    except Exception as e:
+        hata(f"{name}: {e}")
+        if VERBOSE:
+            import traceback
+            print(traceback.format_exc())
+        return False
+    finally:
+        if basarili and cache_path.exists():
+            cache_path.unlink(missing_ok=True)
+
+    return True
+
+def indir(url, hedef, paket_adi="", progress=None):
+    hedef_path = Path(hedef)
+    hedef_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": f"nux/{CLIENT_VERSION}"})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            total = int(response.headers.get("Content-Length", 0))
+            if progress is None:
+                progress = ProgressBar(total, paket_adi)
+            progress.total = total
+            with open(hedef, "wb") as f:
+                while True:
+                    chunk = response.read(1024 * 64)
+                    if not chunk: break
+                    f.write(chunk)
+                    progress.update(chunk)
+            progress.finish()
+        return True
+    except Exception as e:
+        hata(f"{tr('download_error')}: {e}")
+        return False
+
+# ══════════════════════════════════════════════════════════════════
+# TRANSACTION
+# ══════════════════════════════════════════════════════════════════
+
+def rollback_transaction(transaction, db):
+    uyari(tr("rollback_msg"))
+    for action, name, meta in reversed(transaction):
+        if action == "INSTALL":
+            for f in meta.get("files", []):
+                try: Path(f).unlink(missing_ok=True)
+                except Exception: pass
+            shutil.rmtree(_script_store(name), ignore_errors=True)
+            db.pop(name, None)
+    db_kaydet(db)
+    basari(tr("rollback_done"))
+
+# ══════════════════════════════════════════════════════════════════
+# INSTALL
+# ══════════════════════════════════════════════════════════════════
+
+def install(pkgs, dry_run=False):
+    if root_kontrol() and not dry_run: return 1
+    if not pkgs: return hata("nux install <paket>")
+
+    if len(pkgs) == 1 and (pkgs[0].endswith(".nux") or os.path.isfile(pkgs[0])):
+        return local_install(pkgs[0])
+
+    if not dry_run:
+        try: acquire_lock()
+        except LockError as e: return hata(str(e))
+
+    try:
+        db = db_yukle()
+        index = repo_getir_birlesik()
+        if not index or not index.get("packages"):
+            update()
+            index = repo_getir_birlesik()
+        if not index:
+            return hata("Repo erişilemiyor.")
+
+        repo_pkgs = index.get("packages", {})
+        eksik = []
+        for pkg in pkgs:
+            if pkg in db:
+                bilgi(f"{tr('already_installed')}: {pkg}")
+                continue
+            if pkg not in repo_pkgs and not sistemde_paket_var(pkg):
+                eksik.append(pkg)
+
+        if eksik:
+            for pkg in eksik:
+                _oneri_goster(pkg, index)
+            return 1
+
+        yedek = db_yedekle() if not dry_run else None
+        transaction = []
+
+        try:
+            resolver = DependencyResolver(index, db)
+            kurulacak, bilgiler = resolver.coz(pkgs)
+        except ValueError as e:
+            return hata(str(e))
+
+        yeni = [p for p in kurulacak if p not in db]
+        if not yeni:
+            bilgi(tr("all_uptodate"))
+            return 0
+
+        manuel_kokler = set()
+        for pkg in pkgs:
+            provider = resolver.repo_provider(pkg) or pkg
+            manuel_kokler.add(provider)
+
+        toplam_boyut = sum(int(bilgiler[p].get("installed_size", 0) or 0) for p in yeni)
+        indirme = sum(int(bilgiler[p].get("size", 0) or 0) for p in yeni)
+
+        print(f"\n{C}╔{'═'*58}╗{RE}")
+        print(f"{C}║{RE}  {W}{tr('install_pkgs')}{RE}")
+        print(f"{C}╠{'═'*58}╣{RE}")
+
+        for p in yeni:
+            info = bilgiler[p]
+            cls = info.get("class", "base" if p not in manuel_kokler else "app")
+            badge = class_badge(cls)
+            repo_name = info.get("_repo", "")
+            auto = f" {DIM}[auto]{RE}" if p not in manuel_kokler else ""
+            print(f"{C}║{RE}  {G}✓{RE} {C}{p:28}{RE} {Y}{info.get('version','?'):16}{RE} {badge} ← {DIM}{repo_name}{RE}{auto}")
+
+        print(f"{C}╠{'═'*58}╣{RE}")
+        print(f"{C}║{RE}  {W}{tr('total')}:{RE} {len(yeni)} {tr('packages')}")
+        print(f"{C}║{RE}  {W}{tr('installed_size')}:{RE} {boyut_formatla(toplam_boyut)}")
+        print(f"{C}║{RE}  {W}{tr('download_size')}:{RE} {boyut_formatla(indirme)}")
+        print(f"{C}║{RE}  {W}{tr('est_time')}:{RE} {sure_tahmin(indirme)}")
+        print(f"{C}╚{'═'*58}╝{RE}\n")
+
+        if dry_run:
+            bilgi("Dry-run.")
+            return 0
+
+        if not onayla(tr("install_confirm")):
+            bilgi(tr("cancelled"))
+            return 0
+
+        baslangic = time.monotonic()
+        ok = 0
+        hatalar_list = []
+
+        for i, name in enumerate(yeni, 1):
+            print(f"\n{DIM}{'─'*58}{RE}")
+            info = bilgiler[name]
+            auto_flag = name not in manuel_kokler
+
+            eksik_deps = [d for d in info.get("depends", []) if not dep_karsilaniyor_mu(d, db)]
+            if eksik_deps:
+                uyari(f"Skip: {name} ({', '.join(eksik_deps[:3])})")
+                hatalar_list.append(name)
+                continue
+
+            if _pkg_kur(name, info, db, transaction, len(yeni), i, auto_installed=auto_flag):
+                basari(f"✓ {name} {tr('install_done')}")
+                history_yaz("INSTALL", name, info.get("version"))
+                db_kaydet(db)
+                ok += 1
+            else:
+                uyari(f"✗ {name} {tr('install_fail')}")
+                hatalar_list.append(name)
+
+        if ok > 0:
+            with Spinner(tr("system_updating")):
+                sistem_guncelle()
+
+        sure = time.monotonic() - baslangic
+        print()
+        if ok == len(yeni):
+            basari(f"{ok}/{len(yeni)} {tr('packages')} ✓")
+            if yedek: Path(yedek).unlink(missing_ok=True)
+            return 0
+        else:
+            uyari(f"{ok}/{len(yeni)}")
+            if hatalar_list:
+                print(renkli(f"  {', '.join(hatalar_list)}", R))
+            if onayla(tr("rollback_ask")):
+                rollback_transaction(transaction, db)
+            return 1
+    finally:
+        if not dry_run:
+            release_lock()
+
+# ══════════════════════════════════════════════════════════════════
+# LOCAL INSTALL
+# ══════════════════════════════════════════════════════════════════
+
+def local_install(dosya_yolu):
+    if root_kontrol(): return 1
+    path = Path(dosya_yolu)
+    if not path.exists(): return hata(f"{dosya_yolu}")
+    if not dosya_yolu.endswith(".nux"): return hata(".nux")
+
+    try: acquire_lock()
+    except LockError as e: return hata(str(e))
+
+    try:
+        db = db_yukle()
+        transaction = []
+
+        with tarfile.open(str(path), "r:*") as tar:
+            meta = json.loads(tar.extractfile(tar.getmember("metadata.json")).read().decode("utf-8"))
+
+        name = meta.get("name", path.stem)
+        version = meta.get("version", "?")
+        cls = meta.get("class", "app")
+
+        print(f"\n{C}╔{'═'*58}╗{RE}")
+        print(f"{C}║{RE}  {W}{tr('local_install')}{RE}")
+        print(f"{C}╠{'═'*58}╣{RE}")
+        print(f"{C}║{RE}  {G}✓{RE} {C}{name:28}{RE} {Y}{version:16}{RE} {class_badge(cls)}")
+        print(f"{C}║{RE}  {DIM}{dosya_yolu}{RE}")
+        print(f"{C}╚{'═'*58}╝{RE}\n")
+
+        if not onayla(tr("install_confirm")): return 0
+
+        cache_path = Path(CACHE_DIR) / path.name
+        shutil.copy2(path, cache_path)
+        meta["sha256"] = sha256_hash(str(cache_path))
+        meta["filename"] = f"local/{path.name}"
+        meta["managed_by"] = "nux"
+
+        if _pkg_kur(name, meta, db, transaction, auto_installed=False):
+            basari(f"✓ {name} {tr('install_done')}")
+            history_yaz("LOCAL_INSTALL", name, version)
+            db_kaydet(db)
+            sistem_guncelle()
+            return 0
+        else:
+            return hata(f"{name} {tr('install_fail')}")
+    finally:
+        release_lock()
+
+# ══════════════════════════════════════════════════════════════════
+# REMOVE
+# ══════════════════════════════════════════════════════════════════
+
+def remove(pkgs, purge=False):
+    if root_kontrol(): return 1
+    if not pkgs: return hata("nux remove <paket>")
+
+    try: acquire_lock()
+    except LockError as e: return hata(str(e))
+
+    try:
+        db = db_yukle()
+        pins = pin_yukle()
+        silinecek = []
+        for name in pkgs:
+            if name not in db: uyari(f"{tr('not_installed')}: {name}"); continue
+            if name in pins: uyari(f"{tr('pinned_pkg')}: {name}"); continue
+            if name in PROTECTED_PACKAGES or db[name].get("protected"): uyari(f"{tr('protected_pkg')}: {name}"); continue
+            silinecek.append(name)
+        if not silinecek: return 0
+
+        silinecek_set = set(silinecek)
+        for pn, pd in db.items():
+            if pn in silinecek_set: continue
+            for dep in pd.get("depends", []):
+                if not dep_karsilaniyor_mu_haric(dep, db, silinecek_set):
+                    return hata(f"'{pn}' bozulur: {dep}")
+
+        print(f"\n{R}╔{'═'*58}╗{RE}")
+        print(f"{R}║{RE}  {W}{tr('remove_pkgs')} ({len(silinecek)}){RE}")
+        print(f"{R}╠{'═'*58}╣{RE}")
+        for p in silinecek:
+            print(f"{R}║{RE}  {R}✗{RE} {p} {Y}{db[p].get('version','?')}{RE} {class_badge(paket_sinifi(db[p]))}")
+        print(f"{R}╚{'═'*58}╝{RE}\n")
+
+        if not onayla(tr("remove_confirm")): return 0
+
+        for name in silinecek:
+            meta = db[name]
+            sd = _script_store(name)
+            pre = sd / "pre-remove.sh"
+            if pre.exists():
+                run_pkg_script(pre, name, "prerm", ["remove"], meta=meta, fatal=False)
+            for f_str in meta.get("files", []):
+                try:
+                    p = Path(f_str)
+                    if not p.exists() and not p.is_symlink(): continue
+                    if not purge and any(f_str.endswith(c) for c in meta.get("conffiles", [])): continue
+                    p.unlink(missing_ok=True)
+                    try: p.parent.rmdir()
+                    except OSError: pass
+                except Exception: pass
+            post = sd / "post-remove.sh"
+            if post.exists():
+                run_pkg_script(post, name, "postrm", ["purge" if purge else "remove"], meta=meta, fatal=False)
+            shutil.rmtree(sd, ignore_errors=True)
+            del db[name]
+            db_kaydet(db)
+            history_yaz("REMOVE", name, meta.get("version"))
+            basari(f"{tr('remove_done')}: {name}")
+
+        sistem_guncelle()
+        return 0
+    finally:
+        release_lock()
+
+# ══════════════════════════════════════════════════════════════════
+# UPGRADE — SADECE managed_by=nux VE class=app/tool
+# ══════════════════════════════════════════════════════════════════
+
+def upgrade(mode="normal"):
+    if root_kontrol(): return 1
+    try: acquire_lock()
+    except LockError as e: return hata(str(e))
+
+    try:
+        db = db_yukle()
+        index = repo_getir_birlesik()
+        if not index or not index.get("packages"):
+            update()
+            index = repo_getir_birlesik()
+
+        pins = pin_yukle()
+        resolver = DependencyResolver(index, db)
+        guncellenecek = []
+
+        for name, meta in db.items():
+            if name in pins: continue
+
+            managed = paket_yoneticisi(meta)
+            cls = paket_sinifi(meta)
+
+            # SADECE nux tarafından yönetilen paketler
+            if managed != "nux":
+                continue
+
+            # Mode kontrolü
+            if mode == "apps-only" and cls not in ("app",):
+                continue
+            elif mode == "normal" and cls == "base":
+                continue
+            # mode == "full" ise hepsini al
+
+            info = resolver.get_package_info(name)
+            if info:
+                mevcut = db_versiyon_kontrol(name, meta)
+                yeni = info.get("version", "0")
+                cmp = versiyon_karsilastir(yeni, mevcut)
+                if cmp < 0:
+                    uyari(f"Downgrade engellendi: {name} ({mevcut} > {yeni})")
+                    continue
+                if cmp > 0:
+                    guncellenecek.append((name, mevcut, yeni, info))
+
+        if not guncellenecek:
+            basari(tr("all_uptodate"))
+            return 0
+
+        print(f"\n{C}╔{'═'*58}╗{RE}")
+        print(f"{C}║{RE}  {W}{tr('upgradable_pkgs')} ({len(guncellenecek)}){RE}")
+        print(f"{C}╠{'═'*58}╣{RE}")
+        for name, eski, yeni, info in guncellenecek:
+            cls = info.get("class", paket_sinifi(db.get(name, {})))
+            repo_name = info.get("_repo", "")
+            print(f"{C}║{RE}  {C}{name:28}{RE} {Y}{eski:12}{RE} → {G}{yeni}{RE} {class_badge(cls)} ← {DIM}{repo_name}{RE}")
+        print(f"{C}╚{'═'*58}╝{RE}\n")
+
+        if not onayla(tr("upgrade_confirm")): return 0
+
+        nux_updated = False
+        for name, eski, yeni, info in guncellenecek:
+            bilgi(f"{tr('upgrading')}: {name}")
+            eski_meta = db[name]
+            for f in eski_meta.get("files", []):
+                try:
+                    if not any(str(f).endswith(c) for c in eski_meta.get("conffiles", [])):
+                        Path(f).unlink(missing_ok=True)
+                except Exception: pass
+
+            transaction = []
+            if _pkg_kur(name, info, db, transaction):
+                basari(f"{tr('upgrade_done')}: {name}")
+                history_yaz("UPGRADE", name, f"{eski} → {yeni}")
+                db_kaydet(db)
+                if name == "nux": nux_updated = True
+            else:
+                uyari(f"{tr('upgrade_fail')}: {name}")
+
+        sistem_guncelle()
+
+        if nux_updated:
+            basari("nux updated. Restarting...")
+            release_lock()
+            nux_path = shutil.which("nux") or NUX_BIN
+            os.execv(nux_path, ["nux"] + sys.argv[1:])
+
+        return 0
+    finally:
+        release_lock()
+
+# ══════════════════════════════════════════════════════════════════
+# REINSTALL
+# ══════════════════════════════════════════════════════════════════
+
+def reinstall(pkgs):
+    if root_kontrol(): return 1
+    if not pkgs: return hata("nux reinstall <paket>")
+    try: acquire_lock()
+    except LockError as e: return hata(str(e))
+    try:
+        db = db_yukle()
+        index = repo_getir_birlesik()
+        if not index: update(); index = repo_getir_birlesik()
+        transaction = []
+        for name in pkgs:
+            resolver = DependencyResolver(index, db)
+            info = resolver.get_package_info(name)
+            if not info: uyari(f"{tr('pkg_not_found')}: {name}"); continue
+            if name in db:
+                for f in db[name].get("files", []):
+                    try:
+                        if not any(str(f).endswith(c) for c in db[name].get("conffiles", [])):
+                            Path(f).unlink(missing_ok=True)
+                    except Exception: pass
+            cache_p = Path(CACHE_DIR) / Path(info["filename"]).name
+            cache_p.unlink(missing_ok=True)
+            auto = db.get(name, {}).get("auto_installed", False)
+            if _pkg_kur(name, info, db, transaction, auto_installed=auto):
+                basari(f"✓ {name}"); history_yaz("REINSTALL", name, info.get("version")); db_kaydet(db)
+            else: hata(f"{name}")
+        sistem_guncelle()
+        return 0
+    finally:
+        release_lock()
+
+# ══════════════════════════════════════════════════════════════════
+# SCAN-SYSTEM / SYNC-SYSTEM / ADOPT
+# ══════════════════════════════════════════════════════════════════
+
+def scan_system():
+    if root_kontrol(): return 1
+    with Spinner(tr("scan_system")):
+        try:
+            result = subprocess.run(
+                ["dpkg-query","-W","-f=${Package}\t${Version}\t${binary:Summary}\n"],
+                capture_output=True, text=True, timeout=30, env=cmd_env()
+            )
+        except Exception as e:
+            return hata(str(e))
+
+    db = db_yukle()
+    added = 0
+    for line in result.stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 3: continue
+        name, version, summary = parts
+        if not gecerli_paket_adi(name): continue
+        if name in db: continue
+        db[name] = {
+            "name": name,
+            "version": version,
+            "description": summary.strip(),
+            "class": "base",
+            "managed_by": "system",
+            "installed_at": datetime.now().isoformat(),
+            "auto_installed": True,
+            "install_reason": "system",
+        }
+        added += 1
+    db_kaydet(db)
+    basari(f"{added} {tr('packages')}")
+    return 0
+
+def sync_system():
+    if root_kontrol(): return 1
+    with Spinner(tr("sync_system")):
+        try:
+            result = subprocess.run(
+                ["dpkg-query","-W","-f=${Package}\t${Version}\n"],
+                capture_output=True, text=True, timeout=30, env=cmd_env()
+            )
+        except Exception as e:
+            return hata(str(e))
+
+    sys_pkgs = {}
+    for line in result.stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) == 2 and gecerli_paket_adi(parts[0]):
+            sys_pkgs[parts[0]] = parts[1]
+
+    db = db_yukle()
+    updated = removed = added = 0
+
+    for name in list(db.keys()):
+        if paket_yoneticisi(db[name]) != "system": continue
+        if name not in sys_pkgs:
+            del db[name]
+            removed += 1
+        elif db[name].get("version") != sys_pkgs[name]:
+            db[name]["version"] = sys_pkgs[name]
+            updated += 1
+
+    for name, ver in sys_pkgs.items():
+        if name not in db:
+            db[name] = {
+                "name": name, "version": ver,
+                "class": "base", "managed_by": "system",
+                "auto_installed": True, "install_reason": "system",
+            }
+            added += 1
+
+    db_kaydet(db)
+    basari(f"+{added} / ~{updated} / -{removed}")
+    return 0
+
+def adopt(pkgs):
+    if root_kontrol(): return 1
+    db = db_yukle()
+    for name in pkgs:
+        if not _dpkg_kurulu_mu(name):
+            uyari(f"{tr('not_installed')}: {name}")
+            continue
+        try:
+            ver = subprocess.run(
+                ["dpkg-query","-W","-f=${Version}","--",name],
+                capture_output=True, text=True, timeout=5, env=cmd_env()
+            ).stdout.strip()
+        except Exception:
+            ver = "0"
+        db[name] = {
+            "name": name, "version": ver,
+            "class": "base", "managed_by": "system",
+            "auto_installed": False, "install_reason": "manual",
+            "installed_at": datetime.now().isoformat(),
+        }
+        basari(f"{tr('adopted')}: {name}")
+    db_kaydet(db)
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# DOCTOR
+# ══════════════════════════════════════════════════════════════════
+
+def doctor():
+    print(f"\n{C}╔{'═'*50}╗{RE}")
+    print(f"{C}║{RE}  {W}{tr('doctor_title')}{RE}")
+    print(f"{C}╚{'═'*50}╝{RE}\n")
+
+    checks = []
+    db = db_yukle()
+
+    invalid = gecersiz_db_kayitlari(db)
+    nux_count = sum(1 for m in db.values() if paket_yoneticisi(m) == "nux")
+    sys_count = sum(1 for m in db.values() if paket_yoneticisi(m) == "system")
+    checks.append((not invalid, f"{tr('doctor_db')}: {len(db)} ({nux_count} nux, {sys_count} system)"))
+
+    for repo in aktif_repolar()[:3]:
+        try:
+            start = time.monotonic()
+            url = f"{repo['url'].rstrip('/')}/index.json"
+            urllib.request.urlopen(urllib.request.Request(url), timeout=10)
+            ms = (time.monotonic() - start) * 1000
+            checks.append((True, f"{tr('doctor_repo')}: {repo['name']} ({ms:.0f}ms)"))
+        except Exception:
+            checks.append((False, f"{tr('doctor_repo')}: {repo['name']} FAIL"))
+
+    cache_files = list(Path(CACHE_DIR).rglob("*.nux"))
+    cache_size = sum(f.stat().st_size for f in cache_files if f.exists())
+    checks.append((True, f"{tr('doctor_cache')}: {len(cache_files)} / {boyut_formatla(cache_size)}"))
+
+    if Path(LOCK_FILE).exists():
+        pid = Path(LOCK_FILE).read_text().strip()
+        if pid and Path(f"/proc/{pid}").exists():
+            checks.append((False, f"{tr('doctor_lock')}: PID {pid}"))
+        else:
+            checks.append((None, f"{tr('doctor_lock')}: stale"))
+    else:
+        checks.append((True, f"{tr('doctor_lock')}: OK"))
+
+    cc = {"app": 0, "base": 0, "tool": 0}
+    for m in db.values():
+        cc[paket_sinifi(m)] = cc.get(paket_sinifi(m), 0) + 1
+    checks.append((True, f"{tr('doctor_class')}: {cc.get('app',0)} app, {cc.get('base',0)} base, {cc.get('tool',0)} tool"))
+
+    for status, msg in checks:
+        icon = f"{G}✓{RE}" if status is True else (f"{R}✗{RE}" if status is False else f"{Y}!{RE}")
+        print(f"  {icon} {msg}")
+
+    print()
+    issues = sum(1 for s, _ in checks if s is False)
+    if issues == 0: basari(tr("doctor_healthy"))
+    else: uyari(f"{issues} {tr('doctor_issues')}")
+    print()
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# WHY
+# ══════════════════════════════════════════════════════════════════
+
+def why(name):
+    db = db_yukle()
+    if name not in db: return hata(f"{tr('not_installed')}: {name}")
+    meta = db[name]
+
+    print(f"\n  {W}{name}{RE} {tr('why_installed')}:")
+    print()
+
+    if not meta.get("auto_installed"):
+        print(f"    → {G}{tr('why_manual')}{RE}")
+    else:
+        print(f"    → {Y}{tr('why_auto')}{RE}")
+
+    bagimlilar = []
+    for pn, pd in db.items():
+        if pn == name: continue
+        if name in [dep_temizle(d) for d in pd.get("depends", [])]:
+            bagimlilar.append(pn)
+
+    if bagimlilar:
+        print(f"\n    {C}{tr('why_depends')}:{RE}")
+        for p in sorted(bagimlilar):
+            print(f"      ├── {p} {class_badge(paket_sinifi(db.get(p, {})))}")
+
+    print(f"\n    {DIM}Class: {paket_sinifi(meta)}{RE}")
+    print(f"    {DIM}Managed by: {paket_yoneticisi(meta)}{RE}")
+    print(f"    {DIM}Version: {meta.get('version', '?')}{RE}")
+    if meta.get("_installed_from_repo"):
+        print(f"    {DIM}Repo: {meta['_installed_from_repo']}{RE}")
+    print()
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# TREE
+# ══════════════════════════════════════════════════════════════════
+
+def tree(name, max_depth=4):
+    index = repo_getir_birlesik()
+    db = db_yukle()
+    if not index: update(); index = repo_getir_birlesik()
+
+    resolver = DependencyResolver(index, db)
+    info = resolver.get_package_info(name)
+    if not info and name not in db:
+        return hata(f"{tr('pkg_not_found')}: {name}")
+    if not info: info = db.get(name, {})
+
+    cls = info.get("class", paket_sinifi(db.get(name, {})))
+    ver = info.get("version", db.get(name, {}).get("version", "?"))
+    print(f"\n  {W}{name}{RE} {Y}{ver}{RE} {class_badge(cls)}")
+
+    def _print(pkg_info, prefix="  ", depth=0, visited=None):
+        if visited is None: visited = set()
+        if depth >= max_depth: return
+        deps = pkg_info.get("depends", [])
+        for i, dep in enumerate(deps):
+            dn = dep_temizle(dep)
+            if not dn: continue
+            is_last = (i == len(deps) - 1)
+            conn = "└──" if is_last else "├──"
+            child_pfx = "    " if is_last else "│   "
+            if dn in db:
+                st = f"{G}●{RE}"
+                dc = paket_sinifi(db[dn])
+            elif sistemde_paket_var(dn):
+                st = f"{B}●{RE}"
+                dc = "base"
+            else:
+                st = f"{R}○{RE}"
+                dc = "?"
+            badge = class_badge(dc) if dc != "?" else f"{DIM}[?]{RE}"
+            if dn in visited:
+                print(f"{prefix}{conn} {st} {dn} {badge} {DIM}(cycle){RE}")
+                continue
+            print(f"{prefix}{conn} {st} {dn} {badge}")
+            visited.add(dn)
+            di = resolver.get_package_info(dn)
+            if not di and dn in db: di = db[dn]
+            if di and depth < max_depth - 1:
+                _print(di, prefix + child_pfx, depth + 1, visited)
+
+    _print(info)
+    print(f"\n  {DIM}● nux  ● system  ○ missing{RE}\n")
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# OWNS
+# ══════════════════════════════════════════════════════════════════
+
+def owns(filepath):
+    db = db_yukle()
+    filepath = os.path.realpath(filepath)
+    found = []
+    for name, meta in db.items():
+        if filepath in meta.get("files", []):
+            found.append(name)
+    if not found:
+        print(f"\n  {Y}{filepath}{RE}: no owner found\n")
+        return 1
+    print(f"\n  {W}{filepath}{RE}:")
+    for name in found:
+        cls = paket_sinifi(db[name])
+        print(f"    → {C}{name}{RE} {class_badge(cls)}")
+    print()
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# PROVIDES
+# ══════════════════════════════════════════════════════════════════
+
+def provides(name):
+    index = repo_getir_birlesik()
+    db = db_yukle()
+    if not index: update(); index = repo_getir_birlesik()
+
+    found = []
+    for pn, pd in index.get("packages", {}).items():
+        latest = pd.get("latest")
+        if not latest: continue
+        info = pd["versions"][latest]
+        if name in info.get("provides", []):
+            found.append((pn, info.get("version", "?")))
+    for pn, pm in db.items():
+        if name in pm.get("provides", []) and pn not in [f[0] for f in found]:
+            found.append((pn, pm.get("version", "?")))
+
+    if not found:
+        print(f"\n  {Y}'{name}' not provided by any package{RE}\n")
+        return 1
+
+    print(f"\n  {W}'{name}' provided by:{RE}")
+    for pn, ver in found:
+        cls = paket_sinifi(db.get(pn, {}))
+        installed = f" {G}[installed]{RE}" if pn in db else ""
+        print(f"    → {C}{pn}{RE} {Y}{ver}{RE} {class_badge(cls)}{installed}")
+    print()
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# SIZE
+# ══════════════════════════════════════════════════════════════════
+
+def size_report():
+    db = db_yukle()
+    if not db: bilgi(tr("no_packages")); return 0
+    siralama = []
+    for name, meta in db.items():
+        if not gecerli_paket_adi(name): continue
+        if paket_yoneticisi(meta) != "nux": continue
+        boyut = int(meta.get("installed_size", 0) or 0)
+        siralama.append((name, boyut, meta.get("version", "?"), paket_sinifi(meta)))
+    siralama.sort(key=lambda x: x[1], reverse=True)
+
+    if not siralama: bilgi("No nux-managed packages."); return 0
+    max_b = siralama[0][1] if siralama else 1
+
+    print(f"\n{C}╔{'═'*58}╗{RE}")
+    print(f"{C}║{RE}  {W}{tr('size_title')}{RE}")
+    print(f"{C}╚{'═'*58}╝{RE}\n")
+
+    for i, (name, boyut, ver, cls) in enumerate(siralama[:20], 1):
+        bar_len = int((boyut / max_b) * 20) if max_b > 0 else 0
+        bar = "█" * bar_len + "░" * (20 - bar_len)
+        print(f"  {DIM}{i:2}.{RE} {C}{name:25}{RE} {G}{bar}{RE} {Y}{boyut_formatla(boyut):>10}{RE} {class_badge(cls)}")
+
+    toplam = sum(b for _, b, _, _ in siralama)
+    print(f"\n  {W}{tr('total')}:{RE} {Y}{boyut_formatla(toplam)}{RE} ({len(siralama)} {tr('packages')})\n")
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# EXPORT / IMPORT
+# ══════════════════════════════════════════════════════════════════
+
+def export_packages():
+    db = db_yukle()
+    packages = []
+    for name, meta in sorted(db.items()):
+        if not gecerli_paket_adi(name): continue
+        if paket_yoneticisi(meta) != "nux": continue
+        cls = paket_sinifi(meta)
+        auto = "auto" if meta.get("auto_installed") else "manual"
+        packages.append(f"{name}\t{meta.get('version','?')}\t{cls}\t{auto}")
+    print("\n".join(packages))
+    bilgi(f"{len(packages)} {tr('exported')}")
+    return 0
+
+def import_list(dosya_yolu):
+    if root_kontrol(): return 1
+    path = Path(dosya_yolu)
+    if not path.exists(): return hata(f"{dosya_yolu}")
+    pkgs = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                pkgs.append(line.split()[0])
+    if not pkgs: return hata("No packages.")
+    bilgi(f"{len(pkgs)} {tr('packages')}")
+    return install(pkgs)
+
+# ══════════════════════════════════════════════════════════════════
+# SNAPSHOT
+# ══════════════════════════════════════════════════════════════════
+
+def snapshot_create(name=None):
+    if root_kontrol(): return 1
+    ensure_dirs()
+    db = db_yukle()
+    if not name: name = datetime.now().strftime("snap_%Y%m%d_%H%M%S")
+    snap_file = Path(SNAPSHOT_DIR) / f"{name}.json"
+    if snap_file.exists(): return hata(f"exists: {name}")
+    snapshot = {
+        "name": name,
+        "created_at": datetime.now().isoformat(),
+        "nux_version": CLIENT_VERSION,
+        "packages": {
+            pkg: {"version": m.get("version","?"), "class": paket_sinifi(m), "managed_by": paket_yoneticisi(m)}
+            for pkg, m in db.items() if gecerli_paket_adi(pkg) and paket_yoneticisi(m) == "nux"
+        }
+    }
+    with open(snap_file, "w") as f:
+        json.dump(snapshot, f, indent=2, ensure_ascii=False)
+    basari(f"{tr('snapshot_created')}: {name} ({len(snapshot['packages'])} {tr('packages')})")
+    return 0
+
+def snapshot_list():
+    ensure_dirs()
+    snaps = sorted(Path(SNAPSHOT_DIR).glob("*.json"))
+    if not snaps: bilgi(tr("no_snapshots")); return 0
+    print()
+    for sf in snaps:
+        try:
+            with open(sf) as f: data = json.load(f)
+            print(f"  {C}{data.get('name', sf.stem):30}{RE} {DIM}{data.get('created_at','?')[:19]}{RE}  {W}{len(data.get('packages',{}))} pkg{RE}")
+        except Exception:
+            print(f"  {R}{sf.stem}{RE} {DIM}(corrupt){RE}")
+    print()
+    return 0
+
+def snapshot_restore(name):
+    if root_kontrol(): return 1
+    sf = Path(SNAPSHOT_DIR) / f"{name}.json"
+    if not sf.exists(): return hata(f"{name}")
+    with open(sf) as f: snapshot = json.load(f)
+    db = db_yukle()
+    sp = snapshot.get("packages", {})
+    to_install = [p for p in sp if p not in db]
+    to_remove = [p for p in db if p not in sp and gecerli_paket_adi(p) and paket_yoneticisi(db[p]) == "nux"]
+
+    if not to_install and not to_remove:
+        bilgi("Same state."); return 0
+
+    if to_install: print(f"\n  {G}Install:{RE} {len(to_install)}")
+    if to_remove: print(f"  {R}Remove:{RE} {len(to_remove)}")
+    if not onayla("Apply?"): return 0
+    if to_install: install(to_install)
+    if to_remove: remove(to_remove)
+    basari(f"{tr('snapshot_restored')}: {name}")
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# REPO YÖNETİMİ (CLIENT)
+# ══════════════════════════════════════════════════════════════════
+
+def repo_list():
+    repos = repos_yukle()
+    if not repos: bilgi("No repos."); return 0
+
+    print(f"\n{C}╔{'═'*58}╗{RE}")
+    print(f"{C}║{RE}  {W}{tr('repo_list_title')}{RE}")
+    print(f"{C}╠{'═'*58}╣{RE}")
+    for r in repos:
+        icon = f"{G}✅{RE}" if r.get("enabled", True) else f"{Y}⏸️{RE}"
+        pri = r.get("priority", 0)
+        print(f"{C}║{RE}  {icon} {C}{r['name']:20}{RE} [{DIM}pri:{pri}{RE}]")
+        print(f"{C}║{RE}     {DIM}{r['url']}{RE}")
+        if r.get("description"):
+            print(f"{C}║{RE}     {DIM}{r['description']}{RE}")
+    print(f"{C}╚{'═'*58}╝{RE}\n")
+    return 0
+
+def repo_add(name, url, priority=50):
+    repos = repos_yukle()
+    for r in repos:
+        if r["name"] == name:
+            return hata(f"{tr('repo_exists')}: {name}")
+
+    bilgi(f"{name}: {url}")
+    try:
+        req = urllib.request.Request(f"{url.rstrip('/')}/index.json",
+                                     headers={"User-Agent": f"nux/{CLIENT_VERSION}"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            count = data.get("package_count", 0)
+        basari(f"{tr('connection_ok')}: {count} {tr('packages')}")
+    except Exception as e:
+        uyari(f"{tr('connection_fail')}: {e}")
+        if not onayla("Add anyway?"): return 1
+
+    repos.append({
+        "name": name, "url": url,
+        "enabled": True, "priority": priority,
+        "description": "",
+    })
+    repos_kaydet(repos)
+    basari(f"{tr('repo_added')}: {name}")
+    return 0
+
+def repo_remove(name):
+    repos = repos_yukle()
+    new_repos = [r for r in repos if r["name"] != name]
+    if len(new_repos) == len(repos):
+        return hata(f"{tr('repo_not_found')}: {name}")
+    repos_kaydet(new_repos)
+    Path(repo_index_path(name)).unlink(missing_ok=True)
+    basari(f"{tr('repo_removed')}: {name}")
+    return 0
+
+def repo_enable(name):
+    repos = repos_yukle()
+    for r in repos:
+        if r["name"] == name:
+            r["enabled"] = True
+            repos_kaydet(repos)
+            basari(f"{tr('repo_enabled')}: {name}")
+            return 0
+    return hata(f"{tr('repo_not_found')}: {name}")
+
+def repo_disable(name):
+    repos = repos_yukle()
+    for r in repos:
+        if r["name"] == name:
+            r["enabled"] = False
+            repos_kaydet(repos)
+            basari(f"{tr('repo_disabled')}: {name}")
+            return 0
+    return hata(f"{tr('repo_not_found')}: {name}")
+
+# ══════════════════════════════════════════════════════════════════
+# CONFIG MENÜSÜ
+# ══════════════════════════════════════════════════════════════════
+
+def config_menu():
+    global CFG, T, R, G, Y, C, W, M, B, DIM, RE
+
+    while True:
+        CFG = config_yukle()
+        lang_label = "Türkçe" if CFG.get("language") == "tr" else "English"
+        theme_label = CFG.get("theme", "default").capitalize()
+        spinner_label = CFG.get("spinner", "braille").capitalize()
+        anim_label = CFG.get("install_animation", "stepped").capitalize()
+        prog_label = CFG.get("progress_style", "detailed").capitalize()
+
+        print(f"\n{C}╔{'═'*50}╗{RE}")
+        print(f"{C}║{RE}  {W}{tr('config_title')}{RE}")
+        print(f"{C}╠{'═'*50}╣{RE}")
+        print(f"{C}║{RE}  1) 🌐 {tr('config_lang'):20} [{G}{lang_label}{RE}]")
+        print(f"{C}║{RE}  2) 🎨 {tr('config_theme'):20} [{G}{theme_label}{RE}]")
+        print(f"{C}║{RE}  3) 🔄 {tr('config_spinner'):20} [{G}{spinner_label}{RE}]")
+        print(f"{C}║{RE}  4) 📦 {tr('config_animation'):20} [{G}{anim_label}{RE}]")
+        print(f"{C}║{RE}  5) 📊 {tr('config_progress'):20} [{G}{prog_label}{RE}]")
+        print(f"{C}║{RE}  6) ℹ️  {tr('config_about')}")
+        print(f"{C}║{RE}")
+        print(f"{C}║{RE}  0) ← {tr('config_back')}")
+        print(f"{C}╚{'═'*50}╝{RE}")
+
+        try:
+            choice = input(f"\n  {tr('config_select')} [0-6]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if choice == "0" or not choice:
+            break
+        elif choice == "1":
+            print(f"\n  1) Türkçe")
+            print(f"  2) English")
+            lc = input(f"  {tr('config_select')} [1]: ").strip()
+            CFG["language"] = "en" if lc == "2" else "tr"
+        elif choice == "2":
+            for i, t_name in enumerate(["default","minimal","neon","pastel"], 1):
+                print(f"  {i}) {t_name.capitalize()}")
+            tc = input(f"  {tr('config_select')} [1]: ").strip()
+            themes = ["default","minimal","neon","pastel"]
+            idx = int(tc) - 1 if tc.isdigit() and 1 <= int(tc) <= 4 else 0
+            CFG["theme"] = themes[idx]
+        elif choice == "3":
+            for i, (sn, frames) in enumerate(SPINNERS.items(), 1):
+                demo = "".join(frames[:4])
+                print(f"  {i}) {demo}  {sn.capitalize()}")
+            sc = input(f"  {tr('config_select')} [1]: ").strip()
+            snames = list(SPINNERS.keys())
+            idx = int(sc) - 1 if sc.isdigit() and 1 <= int(sc) <= len(snames) else 0
+            CFG["spinner"] = snames[idx]
+        elif choice == "4":
+            for i, an in enumerate(["stepped","classic","detailed"], 1):
+                print(f"  {i}) {an.capitalize()}")
+            ac = input(f"  {tr('config_select')} [1]: ").strip()
+            anims = ["stepped","classic","detailed"]
+            idx = int(ac) - 1 if ac.isdigit() and 1 <= int(ac) <= 3 else 0
+            CFG["install_animation"] = anims[idx]
+        elif choice == "5":
+            for i, ps in enumerate(["detailed","simple","minimal"], 1):
+                print(f"  {i}) {ps.capitalize()}")
+            pc = input(f"  {tr('config_select')} [1]: ").strip()
+            progs = ["detailed","simple","minimal"]
+            idx = int(pc) - 1 if pc.isdigit() and 1 <= int(pc) <= 3 else 0
+            CFG["progress_style"] = progs[idx]
+        elif choice == "6":
+            print(f"\n{C}╔{'═'*58}╗{RE}")
+            print(f"{C}║{RE}")
+            print(f"{C}║{RE}  {W}Nux — Nucora Linux Package Manager v{CLIENT_VERSION}{RE}")
+            print(f"{C}║{RE}")
+            print(f"{C}║{RE}  {tr('about_dev')}")
+            print(f"{C}║{RE}  {W}{tr('about_by')}{RE}")
+            print(f"{C}║{RE}")
+            print(f"{C}║{RE}  {tr('about_infra')}")
+            print(f"{C}║{RE}")
+            print(f"{C}║{RE}  {DIM}{tr('about_motto')}{RE}")
+            print(f"{C}║{RE}")
+            print(f"{C}╠{'═'*58}╣{RE}")
+            print(f"{C}║{RE}  Website:    {C}https://nucoralinux.com.tr{RE}")
+            print(f"{C}║{RE}  Forum:      {C}https://forum.nucoralinux.com.tr{RE}")
+            print(f"{C}║{RE}  Repo:       {C}https://repo.nucoralinux.com.tr{RE}")
+            print(f"{C}║{RE}  Instagram:  {C}https://instagram.com/nucoralinux{RE}")
+            print(f"{C}╚{'═'*58}╝{RE}")
+            input(f"\n  Enter...")
+            continue
+
+        config_kaydet(CFG)
+        T = get_theme()
+        R, G, Y, C, W, M, B, DIM, RE = T["R"], T["G"], T["Y"], T["C"], T["W"], T["M"], T["B"], T["DIM"], T["RE"]
+        basari(tr("config_saved"))
+
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# BAKIM
+# ══════════════════════════════════════════════════════════════════
+
+def clean():
+    if root_kontrol(): return 1
+    dosyalar = list(Path(CACHE_DIR).rglob("*.nux")) + list(Path(CACHE_DIR).rglob("*.partial"))
+    if not dosyalar: bilgi(tr("cache_clean")); return 0
+    toplam = sum(f.stat().st_size for f in dosyalar if f.exists())
+    print(f"\n{len(dosyalar)} files, {boyut_formatla(toplam)}")
+    if not onayla("Clean?"): return 0
+    for f in dosyalar: f.unlink(missing_ok=True)
+    basari(tr("cache_cleaned"))
+    return 0
+
+def autoremove():
+    if root_kontrol(): return 1
+    db = db_yukle()
+    if not db: bilgi(tr("no_packages")); return 0
+    pins = set(pin_yukle())
+    has_auto = any("auto_installed" in m for m in db.values())
+    if not has_auto: return 0
+
+    korunanlar = {n for n, m in db.items() if n in PROTECTED_PACKAGES or m.get("protected")}
+    manuel = {n for n, m in db.items() if not m.get("auto_installed")}
+    kokler = manuel | pins | korunanlar
+    ulasilan = set()
+    kuyruk = list(kokler)
+    while kuyruk:
+        pkg = kuyruk.pop(0)
+        if pkg in ulasilan or pkg not in db: continue
+        ulasilan.add(pkg)
+        for dep in db[pkg].get("depends", []):
+            provider = secili_kurulu_provider(dep, db)
+            if provider and provider not in ulasilan:
+                kuyruk.append(provider)
+
+    orphan = sorted([
+        n for n, m in db.items()
+        if m.get("auto_installed") and n not in ulasilan
+        and n not in pins and n not in korunanlar
+        and paket_yoneticisi(m) == "nux"
+    ])
+    if not orphan: bilgi("No orphans."); return 0
+    print(f"\nOrphan ({len(orphan)}):")
+    for p in orphan:
+        print(f"  {Y}✗{RE} {p} {class_badge(paket_sinifi(db[p]))}")
+    print()
+    if not onayla("Remove?"): return 0
+    return remove(orphan)
+
+def verify(pkgs=None):
+    db = db_yukle()
+    kontrol = pkgs if pkgs else [n for n in db if gecerli_paket_adi(n) and paket_yoneticisi(db[n]) == "nux"]
+    if not kontrol: bilgi(tr("no_packages")); return 0
+    hatali = []
+    for name in kontrol:
+        if name not in db: continue
+        for dosya, beklenen in db[name].get("sha256_files", {}).items():
+            p = Path(dosya)
+            if not p.exists() or (not p.is_symlink() and sha256_hash(dosya) != beklenen):
+                hatali.append(name)
+                break
+    if not hatali: basari(tr("healthy")); return 0
+    print(f"\n{R}{len(hatali)} broken.{RE}")
+    if onayla("Reinstall?"): return reinstall(list(set(hatali)))
+    return 1
+
+def repair():
+    if root_kontrol(): return 1
+    db = db_yukle()
+    if not db: bilgi(tr("no_packages")); return 0
+    with Spinner(tr("scan_system")):
+        hatali = []
+        for name, meta in db.items():
+            if paket_yoneticisi(meta) != "nux": continue
+            for dosya, beklenen in meta.get("sha256_files", {}).items():
+                p = Path(dosya)
+                if not p.exists() or (not p.is_symlink() and sha256_hash(dosya) != beklenen):
+                    hatali.append(name); break
+    if not hatali: basari(tr("all_healthy")); return 0
+    print(f"\n{R}{len(hatali)} broken.{RE}")
+    if onayla("Reinstall?"): return reinstall(hatali)
+    return 1
+
+def db_clean():
+    if root_kontrol(): return 1
+    db = db_yukle()
+    if not db: bilgi(tr("db_empty")); return 0
+    invalid = gecersiz_db_kayitlari(db)
+    if not invalid: basari(tr("db_clean")); return 0
+    print(f"\n{R}{len(invalid)} invalid records.{RE}")
+    if not onayla(f"Clean {len(invalid)}?"): return 0
+    db_yedekle()
+    for n in invalid: del db[n]
+    db_kaydet(db)
+    basari(f"{len(invalid)} cleaned.")
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# SORGULAMA
+# ══════════════════════════════════════════════════════════════════
+
+def list_all():
+    index = repo_getir_birlesik()
+    if not index: update(); index = repo_getir_birlesik()
+    if not index: return hata("Repo unavailable.")
+    db = db_yukle()
+    pkgs = index.get("packages", {})
+    if not pkgs: bilgi("Empty."); return 0
+
+    kategoriler = {"app": {}, "base": {}, "tool": {}}
+    for name, pd in pkgs.items():
+        if not gecerli_paket_adi(name): continue
+        latest = pd.get("latest", "?")
+        info = pd["versions"].get(latest, {})
+        cls = info.get("class", "app")
+        if cls not in kategoriler: cls = "app"
+        kategoriler[cls][name] = (pd, info)
+
+    print(f"\n{C}╔{'═'*65}╗{RE}")
+    print(f"{C}║{RE}  {W}REPO ({len(pkgs)} {tr('packages')}){RE}")
+    print(f"{C}╚{'═'*65}╝{RE}")
+
+    labels = {"app": (G, "APPS"), "tool": (M, "TOOLS"), "base": (Y, "BASE")}
+    for kat in ["app", "tool", "base"]:
+        kd = kategoriler[kat]
+        if not kd: continue
+        color, label = labels[kat]
+        print(f"\n  {color}── {label} ({len(kd)}) ──{RE}")
+        for name in sorted(kd.keys()):
+            pd, info = kd[name]
+            latest = pd.get("latest", "?")
+            repo_name = pd.get("_repo", "")
+            if name in db:
+                cur = db[name].get("version", "?")
+                st = f"{Y}↑{RE}" if cur != latest else f"{G}✓{RE}"
+            else:
+                st = f"{R}○{RE}"
+            size = boyut_formatla(info.get("installed_size", 0))
+            desc = info.get("description", "")[:30]
+            print(f"  {st} {C}{name:25}{RE} {Y}{latest:16}{RE} {size:>8} {class_badge(kat)} {DIM}← {repo_name}{RE}")
+
+    print(f"\n  {G}✓{RE} installed  {Y}↑{RE} upgradeable  {R}○{RE} not installed\n")
+    return 0
+
+def search(query):
+    index = repo_getir_birlesik()
+    if not index: update(); index = repo_getir_birlesik()
+    if not index: return hata("Repo unavailable.")
+    db = db_yukle()
+    q = query.lower()
+    sonuclar = []
+    for name, pkg in index.get("packages", {}).items():
+        latest = pkg.get("latest")
+        if not latest: continue
+        info = pkg["versions"][latest]
+        if q in name.lower() or q in info.get("description", "").lower():
+            sonuclar.append((name, info, pkg.get("_repo", "")))
+    if not sonuclar: uyari(f"'{query}'"); return 0
+    print(f"\n{G}{len(sonuclar)} results:{RE}\n")
+    for name, info, repo_name in sorted(sonuclar):
+        installed = f" {G}[✓]{RE}" if name in db else ""
+        cls = info.get("class", "app")
+        print(f"  {C}{name}{RE} {Y}{info.get('version','?')}{RE}{installed} {class_badge(cls)} ← {DIM}{repo_name}{RE}")
+        if info.get("description"):
+            print(f"     {DIM}{info['description'][:60]}{RE}")
+        print()
+    return 0
+
+def info_cmd(name):
+    index = repo_getir_birlesik()
+    db = db_yukle()
+    pkg = None
+    if index and name in index.get("packages", {}):
+        pd = index["packages"][name]
+        latest = pd.get("latest")
+        if latest: pkg = pd["versions"][latest]
+    kurulu = db.get(name)
+    if not pkg: pkg = kurulu
+    if not pkg: return hata(f"{tr('pkg_not_found')}: {name}")
+
+    cls = pkg.get("class", "app")
+    managed = pkg.get("managed_by", kurulu.get("managed_by", "?") if kurulu else "?")
+
+    print(f"\n{C}╔{'═'*65}╗{RE}")
+    print(f"{C}║{RE}  {W}{name.upper()}{RE}  {class_badge(cls)}")
+    print(f"{C}╠{'═'*65}╣{RE}")
+    print(f"{C}║{RE}  Version:     {Y}{pkg.get('version','?')}{RE}")
+    print(f"{C}║{RE}  Class:       {class_badge(cls)}")
+    print(f"{C}║{RE}  Managed by:  {managed}")
+    print(f"{C}║{RE}  Section:     {pkg.get('section','misc')}")
+    print(f"{C}║{RE}  Size:        {boyut_formatla(pkg.get('installed_size',0))}")
+    if pkg.get("description"):
+        print(f"{C}║{RE}  Description: {pkg['description'][:50]}")
+    if pkg.get("homepage"):
+        print(f"{C}║{RE}  Homepage:    {C}{pkg['homepage']}{RE}")
+    if pkg.get("protected"):
+        print(f"{C}║{RE}  Protected:   {G}Yes{RE}")
+    if kurulu:
+        print(f"{C}║{RE}  Installed:   {G}Yes{RE}")
+        print(f"{C}║{RE}  Date:        {kurulu.get('install_date','?')[:19]}")
+        print(f"{C}║{RE}  Files:       {len(kurulu.get('files',[]))}")
+        if kurulu.get("_installed_from_repo"):
+            print(f"{C}║{RE}  From repo:   {kurulu['_installed_from_repo']}")
+    if pkg.get("depends"):
+        print(f"{C}║{RE}  Depends:     {', '.join(pkg['depends'][:5])}")
+    print(f"{C}╚{'═'*65}╝{RE}\n")
+    return 0
+
+def listele(upgradeable=False):
+    db = db_yukle()
+    pins = pin_yukle()
+    if not db: bilgi(tr("no_packages")); return 0
+
+    if upgradeable:
+        index = repo_getir_birlesik()
+        if not index: update(); index = repo_getir_birlesik()
+        resolver = DependencyResolver(index, db)
+        gun = []
+        for name, meta in db.items():
+            if not gecerli_paket_adi(name): continue
+            if paket_yoneticisi(meta) != "nux": continue
+            if paket_sinifi(meta) == "base": continue
+            info = resolver.get_package_info(name)
+            if info:
+                mevcut = db_versiyon_kontrol(name, meta)
+                yeni = info.get("version", "0")
+                if versiyon_karsilastir(yeni, mevcut) > 0:
+                    gun.append((name, mevcut, yeni))
+        if not gun: basari(tr("all_uptodate")); return 0
+        print(f"\nUpgradeable ({len(gun)}):\n")
+        for name, eski, yeni in sorted(gun):
+            pinli = f" {Y}[PIN]{RE}" if name in pins else ""
+            print(f"  {C}{name:30}{RE} {Y}{eski:15}{RE} → {G}{yeni}{RE} {class_badge(paket_sinifi(db[name]))}{pinli}")
+        print()
+    else:
+        nux_pkgs = {n: m for n, m in db.items() if gecerli_paket_adi(n) and paket_yoneticisi(m) == "nux"}
+        print(f"\nInstalled ({len(nux_pkgs)}):\n")
+        for name, meta in sorted(nux_pkgs.items()):
+            pinli = f" {Y}[PIN]{RE}" if name in pins else ""
+            auto = f" {DIM}[auto]{RE}" if meta.get("auto_installed") else ""
+            print(f"  {G}✓{RE} {C}{name:30}{RE} {Y}{meta.get('version','?')}{RE} {class_badge(paket_sinifi(meta))}{pinli}{auto}")
+        print()
+    return 0
+
+def depends_cmd(name, reverse=False):
+    index = repo_getir_birlesik()
+    db = db_yukle()
+    if not reverse:
+        if not index or name not in index.get("packages", {}):
+            return hata(f"{tr('pkg_not_found')}: {name}")
+        info = index["packages"][name]["versions"][index["packages"][name]["latest"]]
+        deps = info.get("depends", [])
+        if not deps: bilgi(f"{name}: no deps."); return 0
+        print(f"\n{name} depends:\n")
+        for d in deps:
+            dn = dep_temizle(d)
+            if dn in db: st = f"{G}[nux]{RE}"
+            elif sistemde_paket_var(dn): st = f"{B}[sys]{RE}"
+            else: st = f"{R}[missing]{RE}"
+            print(f"   {C}{d}{RE} {st}")
+        print()
+    else:
+        bagimlilar = [pn for pn, pd in db.items()
+                     if gecerli_paket_adi(pn) and name in [dep_temizle(x) for x in pd.get("depends", [])]]
+        if not bagimlilar: bilgi(f"{name}: no rdeps."); return 0
+        print(f"\n{name} rdepends:\n")
+        for p in sorted(bagimlilar):
+            print(f"   {C}{p}{RE} {class_badge(paket_sinifi(db.get(p, {})))}")
+        print()
+    return 0
+
+def policy(name):
+    index = repo_getir_birlesik()
+    db = db_yukle()
+    if not index or name not in index.get("packages", {}):
+        return hata(f"{tr('pkg_not_found')}: {name}")
+    pd = index["packages"][name]
+    kurulu = db.get(name, {})
+    print(f"\n{name}:")
+    print(f"  Installed: {kurulu.get('version') if kurulu else '(none)'}")
+    print(f"  Candidate: {pd.get('latest')}")
+    print(f"  Repo: {pd.get('_repo', '?')}")
+    for v in sorted(pd.get("versions", {}).keys(), key=cmp_to_key(versiyon_karsilastir), reverse=True):
+        marker = "***" if v == kurulu.get("version") else "   "
+        print(f"    {marker} {v}")
+    print()
+    return 0
+
+def count():
+    db = db_yukle()
+    nux_pkgs = {n: m for n, m in db.items() if gecerli_paket_adi(n) and paket_yoneticisi(m) == "nux"}
+    sys_pkgs = {n: m for n, m in db.items() if gecerli_paket_adi(n) and paket_yoneticisi(m) == "system"}
+    cc = {"app": 0, "base": 0, "tool": 0}
+    for m in nux_pkgs.values():
+        cc[paket_sinifi(m)] = cc.get(paket_sinifi(m), 0) + 1
+    print(f"\n  {G}Nux:{RE} {W}{len(nux_pkgs)}{RE}  {B}System:{RE} {W}{len(sys_pkgs)}{RE}")
+    print(f"  {G}App:{RE} {cc.get('app',0)}  {Y}Base:{RE} {cc.get('base',0)}  {M}Tool:{RE} {cc.get('tool',0)}\n")
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# SERVER STATUS
+# ══════════════════════════════════════════════════════════════════
+
+def server_status():
+    for repo in aktif_repolar():
+        try:
+            start = time.monotonic()
+            url = f"{repo['url'].rstrip('/')}/index.json"
+            req = urllib.request.Request(url, headers={"User-Agent": f"nux/{CLIENT_VERSION}"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read())
+            ms = (time.monotonic() - start) * 1000
+            print(f"\n  {G}✓{RE} {C}{repo['name']}{RE}: {ms:.0f}ms, {data.get('package_count', 0)} pkgs")
+        except Exception as e:
+            print(f"\n  {R}✗{RE} {C}{repo['name']}{RE}: {e}")
+    print()
+    return 0
+
+def mirror_test():
+    for repo in aktif_repolar():
+        host = repo["url"].split("//")[-1].split("/")[0]
+        print(f"\n  Testing: {C}{host}{RE}")
+        try:
+            start = time.monotonic()
+            socket.create_connection((host, 443), timeout=5)
+            ms = (time.monotonic() - start) * 1000
+            print(f"  {G}✓{RE} Connect: {ms:.0f}ms")
+        except Exception as e:
+            print(f"  {R}✗{RE} Connect: {e}")
+            continue
+        try:
+            start = time.monotonic()
+            url = f"{repo['url'].rstrip('/')}/index.json"
+            req = urllib.request.Request(url, headers={"User-Agent": f"nux/{CLIENT_VERSION}"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = r.read()
+            elapsed = time.monotonic() - start
+            speed = (len(data) / elapsed) / 1024 / 1024
+            print(f"  {G}✓{RE} Speed: {speed:.2f} MB/s")
+        except Exception as e:
+            print(f"  {R}✗{RE} Download: {e}")
+    print()
+    return 0
+
+def cache_info():
+    dosyalar = list(Path(CACHE_DIR).rglob("*.nux")) + list(Path(CACHE_DIR).rglob("*.partial"))
+    toplam = sum(f.stat().st_size for f in dosyalar if f.exists())
+    idx_size = sum(f.stat().st_size for f in Path(INDEX_CACHE_DIR).glob("*.json") if f.exists())
+    print(f"\n  Cache: {len(dosyalar)} files, {boyut_formatla(toplam)}")
+    print(f"  Index: {boyut_formatla(idx_size)}")
+    print(f"  Total: {boyut_formatla(toplam + idx_size)}\n")
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# MARK
+# ══════════════════════════════════════════════════════════════════
+
+def mark_auto(pkgs):
+    if root_kontrol(): return 1
+    db = db_yukle()
+    for p in pkgs:
+        if p not in db: uyari(f"{tr('not_installed')}: {p}"); continue
+        db[p]["auto_installed"] = True
+        db[p]["install_reason"] = "dependency"
+        basari(f"{tr('auto_marked')}: {p}")
+    db_kaydet(db)
+    return 0
+
+def mark_manual(pkgs):
+    if root_kontrol(): return 1
+    db = db_yukle()
+    for p in pkgs:
+        if p not in db: uyari(f"{tr('not_installed')}: {p}"); continue
+        db[p]["auto_installed"] = False
+        db[p]["install_reason"] = "manual"
+        basari(f"{tr('manual_marked')}: {p}")
+    db_kaydet(db)
+    return 0
+
+# ══════════════════════════════════════════════════════════════════
+# HISTORY
+# ══════════════════════════════════════════════════════════════════
+
+def history_yaz(action, pkg, details=""):
+    ensure_dirs()
+    entry = {"timestamp": datetime.now().isoformat(), "action": action, "package": pkg, "details": details}
+    try:
+        history = []
+        if Path(HISTORY_FILE).exists():
+            with open(HISTORY_FILE) as f: history = json.load(f)
+        history.append(entry)
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+def history_goster(limit=20):
+    if not Path(HISTORY_FILE).exists(): bilgi(tr("no_history")); return 0
+    with open(HISTORY_FILE) as f: history = json.load(f)
+    if not history: bilgi(tr("no_history")); return 0
+    print(f"\nHistory (last {limit}):\n")
+    for i, e in enumerate(history[-limit:], len(history) - min(limit, len(history)) + 1):
+        ts = e.get("timestamp","?")[:19]
+        action = e.get("action","?")
+        pkg = e.get("package","?")
+        color = G if action == "INSTALL" else (R if action == "REMOVE" else C)
+        print(f"  {DIM}#{i:3}{RE} [{ts}] {color}{action:12}{RE} {C}{pkg}{RE}")
+    print(f"\n  {DIM}Rollback: nux rollback <#>{RE}\n")
+    return 0
+
+def rollback(target_id=None):
+    if root_kontrol(): return 1
+    if not Path(HISTORY_FILE).exists(): bilgi(tr("no_history")); return 0
+    with open(HISTORY_FILE) as f: history = json.load(f)
+    if not history: bilgi(tr("no_history")); return 0
+    entry = history[target_id - 1] if target_id and 1 <= target_id <= len(history) else history[-1]
+    action, pkg = entry.get("action"), entry.get("package")
+    bilgi(f"Rollback: {action} {pkg}")
+    if not onayla("Continue?"): return 0
+    if action == "INSTALL": result = remove([pkg])
+    elif action == "REMOVE": result = install([pkg])
+    else: uyari("Not supported."); return 1
+    if result == 0:
+        if not target_id:
+            history.pop()
+            with open(HISTORY_FILE, "w") as f: json.dump(history, f, indent=2, ensure_ascii=False)
+        basari(tr("rollback_done"))
+    return result
+
+# ══════════════════════════════════════════════════════════════════
+# HELP
+# ══════════════════════════════════════════════════════════════════
+
+def yardim():
+    lang = CFG.get("language", "tr")
+    title = "Nucora Linux Paket Yöneticisi" if lang == "tr" else "Nucora Linux Package Manager"
+
+    print(f"""
+{C}╔═══════════════════════════════════════════════════════════╗
+║                                                           ║
+║       ███╗   ██╗██╗   ██╗██╗  ██╗                         ║
+║       ████╗  ██║██║   ██║╚██╗██╔╝                         ║
+║       ██╔██╗ ██║██║   ██║ ╚███╔╝                          ║
+║       ██║╚██╗██║██║   ██║ ██╔██╗                          ║
+║       ██║ ╚████║╚██████╔╝██╔╝ ██╗                         ║
+║       ╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝                         ║
+║                                                           ║
+║   {title} v{CLIENT_VERSION}           ║
+║   https://nucoralinux.com.tr                              ║
+║                                                           ║
+╚═══════════════════════════════════════════════════════════╝{RE}
+
+{G}Package Management:{RE}
+  {C}nux install{RE} <pkg...>        Install packages
+  {C}nux remove{RE}  <pkg...>        Remove packages
+  {C}nux purge{RE}   <pkg...>        Remove + config
+  {C}nux reinstall{RE} <pkg...>      Reinstall
+  {C}nux upgrade{RE}                 Upgrade (app+tool only)
+  {C}nux upgrade --apps-only{RE}     Upgrade apps only
+  {C}nux upgrade --full{RE}          Upgrade all (app+tool+base)
+  {C}nux update{RE}                  Update repo index
+  {C}nux local-install{RE} <file>    Install local .nux
+  {C}nux import{RE} <file>           Bulk install from list
+  {C}nux export{RE}                  Export package list
+
+{Y}Query:{RE}
+  {C}nux search{RE}  <query>         Search packages
+  {C}nux info{RE}    <pkg>           Package info + class
+  {C}nux list{RE}                    Installed packages
+  {C}nux list -u{RE}                 Upgradeable
+  {C}nux list-all{RE}                All repo packages
+  {C}nux depends{RE} <pkg>           Dependencies
+  {C}nux rdepends{RE} <pkg>          Reverse dependencies
+  {C}nux why{RE} <pkg>               Why installed?
+  {C}nux tree{RE} <pkg>              Dependency tree
+  {C}nux owns{RE} <file>             File ownership
+  {C}nux provides{RE} <name>         Virtual package provider
+  {C}nux policy{RE} <pkg>            Version policy
+  {C}nux count{RE}                   Quick summary
+  {C}nux size{RE}                    Disk usage report
+
+{R}Maintenance:{RE}
+  {C}nux verify{RE}  [pkg...]        File integrity
+  {C}nux repair{RE}                  Fix broken packages
+  {C}nux autoremove{RE}              Remove orphans
+  {C}nux clean{RE}                   Clean cache
+  {C}nux doctor{RE}                  System health check
+  {C}nux db-clean{RE}                Clean invalid DB records
+  {C}nux scan-system{RE}             Scan dpkg packages
+  {C}nux sync-system{RE}             Sync DB with system
+  {C}nux adopt{RE} <pkg>             Adopt system package
+
+{M}Advanced:{RE}
+  {C}nux pin{RE}     <pkg...>        Pin package
+  {C}nux unpin{RE}   <pkg...>        Unpin package
+  {C}nux mark-auto{RE} <pkg...>      Mark as auto
+  {C}nux mark-manual{RE} <pkg...>    Mark as manual
+  {C}nux history{RE}                 Operation history
+  {C}nux rollback{RE} [id]           Rollback operation
+  {C}nux snapshot create{RE} [name]  Create snapshot
+  {C}nux snapshot list{RE}           List snapshots
+  {C}nux snapshot restore{RE} <name> Restore snapshot
+  {C}nux config{RE}                  Configuration menu
+  {C}nux repo list{RE}               List repositories
+  {C}nux repo add{RE} <name> <url>   Add repository
+  {C}nux repo remove{RE} <name>      Remove repository
+  {C}nux repo enable{RE} <name>      Enable repository
+  {C}nux repo disable{RE} <name>     Disable repository
+  {C}nux server-status{RE}           Repo server status
+  {C}nux mirror-test{RE}             Connection test
+
+{C}Options:{RE}
+  {Y}-y{RE}  Accept all prompts
+  {Y}-q{RE}  Quiet mode
+  {Y}-v{RE}  Verbose mode
+
+{W}Package Classes:{RE}
+  {G}[APP]{RE}   User application — upgraded normally
+  {Y}[BASE]{RE}  System dependency — hidden from upgrade
+  {M}[TOOL]{RE}  System tool — protected, upgraded normally
+
+{DIM}{tr('about_dev')}
+{tr('about_by')}
+{tr('about_motto')}{RE}
+
+{C}Website:{RE}    https://nucoralinux.com.tr
+{C}Forum:{RE}      https://forum.nucoralinux.com.tr
+{C}Instagram:{RE}  https://instagram.com/nucoralinux
+""")
+
+# ══════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════
+
+def main():
+    global QUIET, ASSUME_YES, VERBOSE, CFG
+
+    args = sys.argv[1:]
+    if "-qq" in args: QUIET = True; args.remove("-qq")
+    elif "-q" in args or "--quiet" in args:
+        QUIET = True; args = [a for a in args if a not in ("-q","--quiet")]
+    if "-y" in args or "--yes" in args:
+        ASSUME_YES = True; args = [a for a in args if a not in ("-y","--yes")]
+    if "-v" in args or "--verbose" in args:
+        VERBOSE = True; args = [a for a in args if a not in ("-v","--verbose")]
+
+    if not args: yardim(); return 0
+
+    cmd = args[0]
+    params = args[1:]
+
+    komutlar = {
+        "install":        lambda: install(params),
+        "remove":         lambda: remove(params),
+        "purge":          lambda: remove(params, purge=True),
+        "reinstall":      lambda: reinstall(params),
+        "upgrade":        lambda: upgrade("apps-only" if "--apps-only" in params else ("full" if "--full" in params else "normal")),
+        "update":         lambda: update(),
+        "dry-run":        lambda: install(params, dry_run=True),
+        "local-install":  lambda: local_install(params[0]) if params else hata("File?"),
+        "import":         lambda: import_list(params[0]) if params else hata("File?"),
+        "export":         lambda: export_packages(),
+        "search":         lambda: search(params[0]) if params else hata("Query?"),
+        "info":           lambda: info_cmd(params[0]) if params else hata("Package?"),
+        "show":           lambda: info_cmd(params[0]) if params else hata("Package?"),
+        "list":           lambda: listele("--upgradeable" in params or "-u" in params),
+        "depends":        lambda: depends_cmd(params[0]) if params else hata("Package?"),
+        "rdepends":       lambda: depends_cmd(params[0], reverse=True) if params else hata("Package?"),
+        "why":            lambda: why(params[0]) if params else hata("Package?"),
+        "tree":           lambda: tree(params[0]) if params else hata("Package?"),
+        "owns":           lambda: owns(params[0]) if params else hata("File?"),
+        "provides":       lambda: provides(params[0]) if params else hata("Name?"),
+        "list-all":       lambda: list_all(),
+        "policy":         lambda: policy(params[0]) if params else hata("Package?"),
+        "verify":         lambda: verify(params or None),
+        "repair":         lambda: repair(),
+        "autoremove":     lambda: autoremove(),
+        "clean":          lambda: clean(),
+        "cache-info":     lambda: cache_info(),
+        "doctor":         lambda: doctor(),
+        "db-clean":       lambda: db_clean(),
+        "scan-system":    lambda: scan_system(),
+        "sync-system":    lambda: sync_system(),
+        "adopt":          lambda: adopt(params) if params else hata("Package?"),
+        "size":           lambda: size_report(),
+        "top":            lambda: size_report(),
+        "count":          lambda: count(),
+        "config":         lambda: config_menu(),
+        "mark-auto":      lambda: mark_auto(params) if params else hata("Package?"),
+        "mark-manual":    lambda: mark_manual(params) if params else hata("Package?"),
+        "pin":            lambda: pin_ekle(params) if params else hata("Package?"),
+        "unpin":          lambda: pin_kaldir(params) if params else hata("Package?"),
+        "hold":           lambda: pin_ekle(params) if params else hata("Package?"),
+        "unhold":         lambda: pin_kaldir(params) if params else hata("Package?"),
+        "history":        lambda: history_goster(),
+        "rollback":       lambda: rollback(int(params[0])) if params and params[0].isdigit() else rollback(),
+        "snapshot":       lambda: (
+            snapshot_create(params[1] if len(params) > 1 else None) if params and params[0] == "create"
+            else snapshot_list() if params and params[0] == "list"
+            else snapshot_restore(params[1]) if params and params[0] == "restore" and len(params) > 1
+            else hata("snapshot create|list|restore")
+        ),
+        "repo":           lambda: (
+            repo_list() if params and params[0] == "list"
+            else repo_add(params[1], params[2], int(params[3]) if len(params) > 3 else 50) if params and params[0] == "add" and len(params) >= 3
+            else repo_remove(params[1]) if params and params[0] == "remove" and len(params) >= 2
+            else repo_enable(params[1]) if params and params[0] == "enable" and len(params) >= 2
+            else repo_disable(params[1]) if params and params[0] == "disable" and len(params) >= 2
+            else hata("repo list|add|remove|enable|disable")
+        ),
+        "server-status":  lambda: server_status(),
+        "mirror-test":    lambda: mirror_test(),
+        "log":            lambda: history_goster(),
+        "help":           lambda: yardim(),
+        "--help":         lambda: yardim(),
+        "-h":             lambda: yardim(),
+        "version":        lambda: print(renkli(f"nux {CLIENT_VERSION}", G)),
+        "--version":      lambda: print(renkli(f"nux {CLIENT_VERSION}", G)),
+    }
+
+    if cmd in komutlar:
+        try:
+            return komutlar[cmd]() or 0
+        except KeyboardInterrupt:
+            print(renkli("\n[!] Cancelled.", Y))
+            return 130
+        except Exception as e:
+            if VERBOSE:
+                import traceback
+                print(traceback.format_exc())
+            return hata(f"{e}")
+
+    hata(f"Unknown: {cmd}")
+    print(f"\n  {C}nux help{RE}\n")
+    return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
