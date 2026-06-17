@@ -91,6 +91,7 @@ sudo bash install.sh
 
 ⚡ Quick Start
 After installation, update the database and install your first package:
+```bash
 sudo nux update
 sudo nux search discord
 sudo nux install discord
@@ -100,9 +101,10 @@ nux help
 nux doctor
 nux repo list
 nux config
-
+```
 📚 Command Overview
 Package Management
+```bash
 nux install <pkg...>
 nux remove <pkg...>
 nux purge <pkg...>
@@ -112,8 +114,9 @@ nux upgrade --apps-only
 nux upgrade --full
 nux update
 nux local-install <file.nux>
-
+```
 Query / Inspection
+```bash
 nux search <query>
 nux info <package>
 nux list
@@ -128,8 +131,9 @@ nux provides <name>
 nux policy <package>
 nux size
 nux count
-
+```
 Maintenance
+```bash
 nux doctor
 nux verify [pkg...]
 nux repair
@@ -139,46 +143,53 @@ nux db-clean
 nux scan-system
 nux sync-system
 nux adopt <package>
-
+```
 State Management
+```bash
 nux export
 nux import <file>
 nux snapshot create [name]
 nux snapshot list
 nux snapshot restore <name>
-
+```
 Advanced
+```bash
 nux pin <pkg...>
 nux unpin <pkg...>
 nux mark-auto <pkg...>
 nux mark-manual <pkg...>
 nux history
 nux rollback [id]
-
+```
 🌐 Repository Management
 nux supports multiple repositories with priorities. The default repository is https://repo.nucoralinux.com.tr/nux.
 List repositories:
 nux repo list
 
 Add a repository:
+```bash
 sudo nux repo add myrepo [https://example.com/nux](https://example.com/nux)
-
+```
 Remove a repository:
+```bash
 sudo nux repo remove myrepo
-
+```
 Enable / Disable a repository:
+```bash
 sudo nux repo enable myrepo
 sudo nux repo disable myrepo
-
+```
 📁 File Layout
+```bash
 Binary: /usr/local/bin/nux
 Main library: /usr/local/lib/nux/
 State / Database: /var/lib/nux/
 Cache: /var/cache/nux/
 Configuration: /etc/nux/config.json & /etc/nux/repos.json
-
+```
 ⚙️ Configuration Files
 Main config file (/etc/nux/config.json):
+```bash
 {
   "language": "tr",
   "theme": "default",
@@ -187,8 +198,9 @@ Main config file (/etc/nux/config.json):
   "progress_style": "detailed",
   "show_stats": true
 }
-
+```
 Repositories file (/etc/nux/repos.json):
+```bash
 {
   "repos": [
     {
@@ -200,7 +212,7 @@ Repositories file (/etc/nux/repos.json):
     }
   ]
 }
-
+```
 📋 Changelog
 v4.5.0
 package class system (app / base / tool)
