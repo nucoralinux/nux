@@ -88,7 +88,10 @@ git clone [https://github.com/nucoralinux/nux.git](https://github.com/nucoralinu
 cd nux
 sudo bash install.sh
 ```
-
+### For Remove
+```bash
+sudo bash uninstall.sh
+```
 ⚡ Quick Start
 After installation, update the database and install your first package:
 ```bash
