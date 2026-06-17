@@ -1,10 +1,6 @@
 <!-- Copyright (C) 2026 Nucora Linux By : Efe Enes -->
 <!-- License: GNU General Public License v3.0 -->
 
-<p align="center">
-  <img src="assets/banner.png" alt="nux banner" width="100%">
-</p>
-
 <h1 align="center">nux</h1>
 <p align="center">
   Modern Package Manager for Nucora Linux
