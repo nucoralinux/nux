@@ -84,7 +84,7 @@ Features an interactive config menu (`nux config`), Turkish/English support, ani
 ### Install from GitHub
 
 ```bash
-git clone [https://github.com/nucoralinux/nux.git](https://github.com/nucoralinux/nux.git)
+git clone https://github.com/nucoralinux/nux
 cd nux
 sudo bash install.sh
 ```
