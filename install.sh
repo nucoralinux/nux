@@ -99,6 +99,15 @@ fi
 install -Dm755 nux /usr/local/bin/nux
 echo -e "  ${G}OK${RE} /usr/local/bin/nux"
 
+# Nucora Linux uyumlulugu icin /usr/bin'e de symlink
+if [ -L /usr/bin/nux ]; then
+    rm -f /usr/bin/nux
+fi
+if [ ! -e /usr/bin/nux ]; then
+    ln -s /usr/local/bin/nux /usr/bin/nux
+    echo -e "  ${G}OK${RE} /usr/bin/nux (symlink)"
+fi
+
 # Lib dizini
 mkdir -p /usr/local/lib/nux
 cp nux /usr/local/lib/nux/nux.py
