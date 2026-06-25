@@ -1608,6 +1608,45 @@ def remove(pkgs, purge=False):
 # UPGRADE — SADECE managed_by=nux VE class=app/tool
 # ══════════════════════════════════════════════════════════════════
 
+# Kritik sistem paketleri - ASLA upgrade edilmez
+SYSTEM_CRITICAL = {
+    # glibc ailesi - kernel panic riski cok yuksek
+    "libc6", "libc6-dev", "libc6-i386", "libc6-x32",
+    "libc-bin", "libc6-udeb", "libc6-pic", "libc6-dev-i386",
+    # Standart kutuphane
+    "libstdc++6", "libstdc++-12-dev", "libstdc++-11-dev",
+    "libgcc-s1", "libgcc-s2", "libgcc1",
+    # Linker ve loader
+    "ld-linux-x86-64.so.2", "ld-linux-i386.so.2", "ldd",
+    "libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0",
+    # Coreutils ve temel sistem
+    "bash", "coreutils", "dpkg", "apt", "tar", "gzip", "xz-utils",
+    "bzip2", "sed", "grep", "findutils", "pwd", "id", "test",
+    # Sistem metadata
+    "base-files", "base-passwd", "passwd", "login", "shadow",
+    # Saat dilimi ve locale
+    "tzdata", "locales", "locales-all", "basenc",
+    # Nux kendisi
+    "nux",
+}
+
+# Glibc ailesi kontrolu (ekstra guvenlik)
+GLIBC_PATTERN = re.compile(r'^libc6|^libc-bin|^libstdc\+\+|libgcc')
+
+def _sistem_kritik_paket(name):
+    """Paketin sistem kritik olup olmadigini kontrol et"""
+    if name in SYSTEM_CRITICAL:
+        return True
+    if name in PROTECTED_PACKAGES:
+        return True
+    if GLIBC_PATTERN.match(name):
+        return True
+    # Kritik on ekler
+    for prefix in ("libc", "libstdc", "libm", "libdl", "libpthread", "libnsl", "libnss"):
+        if name.startswith(prefix) and not name.startswith("libcaca"):
+            return True
+    return False
+
 def upgrade(mode="normal"):
     if root_kontrol(): return 1
     try: acquire_lock()
@@ -1623,21 +1662,30 @@ def upgrade(mode="normal"):
         pins = pin_yukle()
         resolver = DependencyResolver(index, db)
         guncellenecek = []
+        atlanan = []
 
         for name, meta in db.items():
             if name in pins: continue
+
+            # KRITIK PAKET KONTROLU - en oncelikli
+            if _sistem_kritik_paket(name):
+                atlanan.append((name, "system critical"))
+                continue
 
             managed = paket_yoneticisi(meta)
             cls = paket_sinifi(meta)
 
             # SADECE nux tarafından yönetilen paketler
             if managed != "nux":
+                atlanan.append((name, "managed by system"))
                 continue
 
             # Mode kontrolü
             if mode == "apps-only" and cls not in ("app",):
+                atlanan.append((name, f"class={cls}"))
                 continue
             elif mode == "normal" and cls == "base":
+                atlanan.append((name, f"class={cls}"))
                 continue
             # mode == "full" ise hepsini al
 
@@ -1653,6 +1701,12 @@ def upgrade(mode="normal"):
                     guncellenecek.append((name, mevcut, yeni, info))
 
         if not guncellenecek:
+            if atlanan:
+                basari(tr("all_uptodate"))
+                bilgi(f"{len(atlanan)} paket koruma altinda atlandi")
+                for n, reason in atlanan[:5]:
+                    debug(f"  {Y}{n}{RE}: {reason}")
+                return 0
             basari(tr("all_uptodate"))
             return 0
 
@@ -1663,6 +1717,8 @@ def upgrade(mode="normal"):
             cls = info.get("class", paket_sinifi(db.get(name, {})))
             repo_name = info.get("_repo", "")
             print(f"{C}║{RE}  {C}{name:28}{RE} {Y}{eski:12}{RE} → {G}{yeni}{RE} {class_badge(cls)} ← {DIM}{repo_name}{RE}")
+        print(f"{C}╠{'═'*58}╣{RE}")
+        print(f"{C}║{RE}  {DIM}{len(atlanan)} paket koruma altinda atlandi{RE}")
         print(f"{C}╚{'═'*58}╝{RE}\n")
 
         if not onayla(tr("upgrade_confirm")): return 0
